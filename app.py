@@ -17,7 +17,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
-    QListWidget, QListWidgetItem, QSplitter
+    QListWidget, QListWidgetItem, QSplitter, QProgressBar
 )
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
@@ -176,7 +176,7 @@ class ModelLoaderThread(QThread):
 
 
 class InferenceThread(QThread):
-    progress = pyqtSignal(int, int, str)
+    progress = pyqtSignal(int, int, int, str)  # current, total, percent, message
     finished_ok = pyqtSignal(list, float)
     failed = pyqtSignal(str)
 
@@ -231,6 +231,10 @@ class InferenceThread(QThread):
             results = []
             total = len(self.gt_rows)
 
+            if total == 0:
+                self.finished_ok.emit([], 0.0)
+                return
+
             log(f"Starting background inference for {total} segments", force=True)
 
             for i, row in enumerate(self.gt_rows, start=1):
@@ -257,9 +261,11 @@ class InferenceThread(QThread):
                     "score": score,
                 })
 
+                percent = int((i / total) * 100)
+                msg = f"{i}/{total} | XLSX='{row['label']}' | MODEL='{pred}' | score={score:.3f}"
+                self.progress.emit(i, total, percent, msg)
+
                 if i == 1 or i % 5 == 0 or i == total:
-                    msg = f"{i}/{total} | XLSX='{row['label']}' | MODEL='{pred}' | score={score:.3f}"
-                    self.progress.emit(i, total, msg)
                     log(msg, force=True)
 
             mean_score = np.mean([r["score"] for r in results]) if results else 0.0
@@ -388,6 +394,26 @@ class ProfessionalAnnotationTool(QMainWindow):
         self.status_label = QLabel("Load audio and ground truth to begin.")
         self.status_label.setStyleSheet("padding: 6px; font-size: 13px;")
 
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFixedHeight(18)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #cfcfcf;
+                border-radius: 4px;
+                background: #f3f4f6;
+                text-align: center;
+                font-size: 11px;
+            }
+            QProgressBar::chunk {
+                background-color: #3b82f6;
+                border-radius: 4px;
+            }
+        """)
+
         self.fig, self.ax = plt.subplots(figsize=(14, 6))
         self.canvas = FigureCanvas(self.fig)
         self.toolbar = NavigationToolbar(self.canvas, self)
@@ -439,6 +465,7 @@ class ProfessionalAnnotationTool(QMainWindow):
         root_layout.addLayout(menu_row_1)
         root_layout.addLayout(menu_row_2)
         root_layout.addWidget(self.status_label)
+        root_layout.addWidget(self.progress_bar)
         root_layout.addWidget(splitter)
 
     def set_ui_busy(self, busy: bool, msg: str = ""):
@@ -493,6 +520,7 @@ class ProfessionalAnnotationTool(QMainWindow):
             self.audio_path = path
             self.results = []
             self.selected_index = None
+            self.progress_bar.setValue(0)
 
             self.build_plot_cache()
 
@@ -546,6 +574,7 @@ class ProfessionalAnnotationTool(QMainWindow):
             self.xlsx_path = path
             self.results = []
             self.selected_index = None
+            self.progress_bar.setValue(0)
 
             log(f"GT rows loaded: {len(rows)} | skipped={skipped}", force=True)
 
@@ -606,6 +635,7 @@ class ProfessionalAnnotationTool(QMainWindow):
         self.redraw_plot()
 
         self.is_inference_running = True
+        self.progress_bar.setValue(0)
         self.set_ui_busy(True, "Running prediction in background...")
 
         self.infer_thread = InferenceThread(
@@ -623,8 +653,9 @@ class ProfessionalAnnotationTool(QMainWindow):
         self.infer_thread.failed.connect(self.on_inference_failed)
         self.infer_thread.start()
 
-    def on_inference_progress(self, i, total, msg):
+    def on_inference_progress(self, i, total, percent, msg):
         self.status_label.setText(f"Running prediction... {i}/{total}")
+        self.progress_bar.setValue(percent)
         log(msg, force=True)
 
     def on_inference_finished(self, results, mean_score):
@@ -633,6 +664,7 @@ class ProfessionalAnnotationTool(QMainWindow):
 
         log(f"Inference finished | mean_score={mean_score:.3f}", force=True)
 
+        self.progress_bar.setValue(100)
         self.set_ui_busy(False, f"Done. Segments={len(results)} | Mean match={mean_score:.3f}")
         self.refresh_segment_list()
         self.redraw_plot()
@@ -640,6 +672,7 @@ class ProfessionalAnnotationTool(QMainWindow):
     def on_inference_failed(self, message):
         self.is_inference_running = False
         err(f"Inference failed: {message}")
+        self.progress_bar.setValue(0)
         self.set_ui_busy(False, "Inference failed.")
         QMessageBox.critical(self, "Inference Error", message)
 
