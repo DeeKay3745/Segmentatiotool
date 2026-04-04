@@ -1,3 +1,14 @@
+"""
+Professional Indic Language Annotation & Segmentation Tool
+Supports: Gujarati, Hindi, Marathi, English
+Features:
+  - Multiple Whisper model sizes (small → large-v3)
+  - VAD-based auto-segmentation (librosa + energy-based)
+  - Proper CER/WER evaluation metrics
+  - Improved Unicode handling for all Indic scripts
+  - Font auto-detection with fallbacks
+"""
+
 import os
 import sys
 import csv
@@ -17,7 +28,8 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
-    QListWidget, QListWidgetItem, QSplitter, QProgressBar
+    QListWidget, QListWidgetItem, QSplitter, QProgressBar,
+    QGroupBox, QDoubleSpinBox, QSpinBox, QCheckBox, QTabWidget,
 )
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
@@ -26,158 +38,302 @@ import torch
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
 
-MODEL_ID = "openai/whisper-small"
+# ── Model options (larger = better Indic support, slower) ──────────────────
+MODEL_OPTIONS = [
+    ("Whisper Small  (fast, lower accuracy)", "openai/whisper-small"),
+    ("Whisper Medium (balanced)",             "openai/whisper-medium"),
+    ("Whisper Large-v3 (best accuracy)",      "openai/whisper-large-v3"),
+]
 
 LANG_OPTIONS = [
-    ("English", "en", "english"),
-    ("Hindi", "hi", "hindi"),
+    ("English",  "en", "english"),
+    ("Hindi",    "hi", "hindi"),
     ("Gujarati", "gu", "gujarati"),
-    ("Marathi", "mr", "marathi"),
+    ("Marathi",  "mr", "marathi"),
 ]
 
 PREDICTION_MODES = [
-    ("Word", "word"),
-    ("Character", "char"),
+    ("Full Transcript", "full"),
+    ("Word",            "word"),
+    ("Character",       "char"),
 ]
+
+# ── Unicode blocks for Indic scripts ──────────────────────────────────────
+# Devanagari (Hindi, Marathi, Sanskrit)
+_DEVANAGARI     = r"\u0900-\u097F"
+_DEVANAGARI_EXT = r"\uA8E0-\uA8FF"
+_VEDIC_EXT      = r"\u1CD0-\u1CFF"
+
+# Gujarati
+_GUJARATI = r"\u0A80-\u0AFF"
+
+# Combined Indic pattern for cleaning
+_INDIC_RANGES = (
+    f"{_DEVANAGARI}{_DEVANAGARI_EXT}{_VEDIC_EXT}{_GUJARATI}"
+)
+
+# Regex: keep Latin + digits + Indic + spaces + common punctuation
+_KEEP_PATTERN = re.compile(
+    rf"[^A-Za-z0-9\s{_INDIC_RANGES}.,!?'\-]",
+    re.UNICODE,
+)
 
 VERBOSE = False
 
 
+# ── Logging helpers ───────────────────────────────────────────────────────
 def log(msg, force=False):
     if VERBOSE or force:
         print(f"[LOG] {msg}", flush=True)
 
-
 def warn(msg):
     print(f"[WARN] {msg}", flush=True)
-
 
 def err(msg):
     print(f"[ERROR] {msg}", flush=True)
 
 
+# ── Utility functions ─────────────────────────────────────────────────────
 def time_to_sec(x):
     if pd.isna(x):
         return None
     x = str(x).strip()
     if not x:
         return None
-    try:
-        dt = datetime.strptime(x, "%H:%M:%S.%f")
-    except ValueError:
+    for fmt in ("%H:%M:%S.%f", "%H:%M:%S", "%M:%S.%f", "%M:%S"):
         try:
-            dt = datetime.strptime(x, "%H:%M:%S")
+            dt = datetime.strptime(x, fmt)
+            return dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
         except ValueError:
-            return None
-    return dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
+            continue
+    # Try parsing as raw seconds
+    try:
+        return float(x)
+    except ValueError:
+        return None
 
 
 def norm_text(s):
-    return "".join(str(s).strip().split())
+    """Normalize text: lowercase, strip whitespace, remove punctuation."""
+    s = str(s).strip().lower()
+    s = re.sub(rf"[^a-z0-9{_INDIC_RANGES}]", "", s, flags=re.UNICODE)
+    return s
 
 
-def simple_match(pred, gt):
-    pred = norm_text(pred)
-    gt = norm_text(gt)
-    if not pred and not gt:
-        return 1.0
-    if not pred or not gt:
+def edit_distance(s1, s2):
+    """Standard Levenshtein edit distance."""
+    n, m = len(s1), len(s2)
+    if n == 0:
+        return m
+    if m == 0:
+        return n
+
+    dp = list(range(m + 1))
+    for i in range(1, n + 1):
+        prev = dp[0]
+        dp[0] = i
+        for j in range(1, m + 1):
+            temp = dp[j]
+            if s1[i - 1] == s2[j - 1]:
+                dp[j] = prev
+            else:
+                dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+            prev = temp
+    return dp[m]
+
+
+def compute_cer(pred, gt):
+    """Character Error Rate: edit_distance / len(gt). Lower = better."""
+    pred_n = norm_text(pred)
+    gt_n = norm_text(gt)
+    if not gt_n and not pred_n:
         return 0.0
-    if pred == gt:
+    if not gt_n:
         return 1.0
-    common = sum(min(pred.count(ch), gt.count(ch)) for ch in set(pred) | set(gt))
-    return common / max(len(pred), len(gt))
+    dist = edit_distance(pred_n, gt_n)
+    return min(dist / len(gt_n), 1.0)
 
 
-def clean_prediction(text: str, mode: str = "word") -> str:
+def compute_accuracy(pred, gt):
+    """1 - CER, clamped to [0, 1]. Higher = better."""
+    return max(0.0, 1.0 - compute_cer(pred, gt))
+
+
+def clean_prediction(text: str, mode: str = "full") -> str:
+    """Clean Whisper output, preserving Indic script characters."""
     if not text:
         return ""
 
     text = str(text).strip()
 
-    # Keep English letters/numbers/underscore + spaces + Indic blocks
-    text = re.sub(r"[^\w\s\u0900-\u097F\u0A80-\u0AFF]", "", text, flags=re.UNICODE)
+    # Remove characters outside our allowed set
+    text = _KEEP_PATTERN.sub("", text)
     text = re.sub(r"\s+", " ", text).strip()
 
     if not text:
         return ""
 
+    if mode == "full":
+        return text
+
     if mode == "word":
-        return text.split(" ")[0].strip()
+        return text.split()[0] if text.split() else ""
 
     if mode == "char":
-        # Prefer Indic or English alphabetic character only
-        filtered = re.sub(r"[^A-Za-z\u0900-\u097F\u0A80-\u0AFF]", "", text)
+        # Prefer Indic or Latin alphabetic character
+        filtered = re.sub(
+            rf"[^A-Za-z{_INDIC_RANGES}]", "", text, flags=re.UNICODE
+        )
         return filtered[0] if filtered else ""
 
     return text
 
 
 def pick_font_for_language(lang_code: str):
-    if lang_code in ("hi", "mr"):
-        candidates = [
-            "/Library/Fonts/NotoSansDevanagari-Regular.ttf",
-            "/System/Library/Fonts/Supplemental/NotoSansDevanagari-Regular.ttf",
-            os.path.expanduser("~/Library/Fonts/NotoSansDevanagari-Regular.ttf"),
-        ]
-        families = [
-            "Noto Sans Devanagari",
-            "Kohinoor Devanagari",
-            "Arial Unicode MS",
-            "Mangal",
-        ]
-    elif lang_code == "gu":
-        candidates = [
-            "/Library/Fonts/NotoSansGujarati-Regular.ttf",
-            "/System/Library/Fonts/Supplemental/NotoSansGujarati-Regular.ttf",
-            os.path.expanduser("~/Library/Fonts/NotoSansGujarati-Regular.ttf"),
-        ]
-        families = [
-            "Noto Sans Gujarati",
-            "Shruti",
-            "Arial Unicode MS",
-        ]
-    else:  # English and fallback
-        candidates = []
-        families = [
-            "Arial",
-            "Helvetica",
-            "Arial Unicode MS",
-            "DejaVu Sans",
-        ]
+    """Find a suitable font for rendering Indic text on plots."""
+    font_map = {
+        "hi": {
+            "files": [
+                "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+                "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf",
+                "/Library/Fonts/NotoSansDevanagari-Regular.ttf",
+                os.path.expanduser("~/Library/Fonts/NotoSansDevanagari-Regular.ttf"),
+            ],
+            "families": [
+                "Noto Sans Devanagari", "Lohit Devanagari",
+                "Kohinoor Devanagari", "Mangal", "Arial Unicode MS",
+            ],
+        },
+        "mr": None,  # Marathi uses Devanagari → same as Hindi
+        "gu": {
+            "files": [
+                "/usr/share/fonts/truetype/noto/NotoSansGujarati-Regular.ttf",
+                "/usr/share/fonts/truetype/lohit-gujarati/Lohit-Gujarati.ttf",
+                "/Library/Fonts/NotoSansGujarati-Regular.ttf",
+                os.path.expanduser("~/Library/Fonts/NotoSansGujarati-Regular.ttf"),
+            ],
+            "families": [
+                "Noto Sans Gujarati", "Lohit Gujarati",
+                "Shruti", "Arial Unicode MS",
+            ],
+        },
+        "en": {
+            "files": [],
+            "families": ["Arial", "Helvetica", "DejaVu Sans"],
+        },
+    }
 
-    for path in candidates:
+    if lang_code == "mr":
+        lang_code = "hi"
+
+    spec = font_map.get(lang_code, font_map["en"])
+
+    for path in spec["files"]:
         if os.path.exists(path):
             return fm.FontProperties(fname=path)
 
     installed = {f.name for f in fm.fontManager.ttflist}
-    for fam in families:
+    for fam in spec["families"]:
         if fam in installed:
             return fm.FontProperties(family=fam)
 
     return None
 
 
+# ── VAD / Auto-Segmentation ──────────────────────────────────────────────
+def vad_segment_audio(
+    y, sr,
+    min_silence_ms=300,
+    silence_thresh_db=-40,
+    min_segment_ms=200,
+    max_segment_ms=10000,
+):
+    """
+    Energy-based Voice Activity Detection segmentation.
+    Splits audio into voiced segments using RMS energy thresholding.
+    """
+    frame_length = int(sr * 0.025)   # 25 ms frames
+    hop_length   = int(sr * 0.010)   # 10 ms hop
+
+    rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+    rms_db = librosa.amplitude_to_db(rms, ref=np.max(rms) if np.max(rms) > 0 else 1.0)
+
+    is_voice = rms_db > silence_thresh_db
+
+    min_silence_frames = int((min_silence_ms / 1000) * sr / hop_length)
+    min_segment_frames = int((min_segment_ms / 1000) * sr / hop_length)
+    max_segment_frames = int((max_segment_ms / 1000) * sr / hop_length)
+
+    segments = []
+    in_segment = False
+    seg_start = 0
+    silence_count = 0
+
+    for i, v in enumerate(is_voice):
+        if v:
+            if not in_segment:
+                seg_start = i
+                in_segment = True
+                silence_count = 0
+            else:
+                silence_count = 0
+                # Force-split very long segments
+                if (i - seg_start) >= max_segment_frames:
+                    segments.append((seg_start, i))
+                    seg_start = i
+        else:
+            if in_segment:
+                silence_count += 1
+                if silence_count >= min_silence_frames:
+                    seg_end = i - silence_count
+                    if (seg_end - seg_start) >= min_segment_frames:
+                        segments.append((seg_start, seg_end))
+                    in_segment = False
+                    silence_count = 0
+
+    # Flush last segment
+    if in_segment:
+        seg_end = len(is_voice) - 1
+        if (seg_end - seg_start) >= min_segment_frames:
+            segments.append((seg_start, seg_end))
+
+    # Convert frame indices to seconds
+    result = []
+    for s_frame, e_frame in segments:
+        s_sec = s_frame * hop_length / sr
+        e_sec = e_frame * hop_length / sr
+        e_sec = min(e_sec, len(y) / sr)
+        result.append({"start": round(s_sec, 4), "end": round(e_sec, 4)})
+
+    log(f"VAD found {len(result)} segments", force=True)
+    return result
+
+
+# ── Threads ───────────────────────────────────────────────────────────────
 class ModelLoaderThread(QThread):
     finished_ok = pyqtSignal(object, object, str)
     failed = pyqtSignal(str)
+
+    def __init__(self, model_id):
+        super().__init__()
+        self.model_id = model_id
 
     def run(self):
         try:
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
             dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-            log(f"Loading model {MODEL_ID} on {device}", force=True)
+            log(f"Loading model {self.model_id} on {device}", force=True)
 
             model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                MODEL_ID,
-                dtype=dtype,
+                self.model_id,
+                torch_dtype=dtype,
                 low_cpu_mem_usage=True,
-                use_safetensors=torch.cuda.is_available(),
+                use_safetensors=True,
             )
             model.to(device)
 
-            processor = AutoProcessor.from_pretrained(MODEL_ID)
+            processor = AutoProcessor.from_pretrained(self.model_id)
             self.finished_ok.emit(model, processor, device)
         except Exception as e:
             traceback.print_exc()
@@ -185,11 +341,12 @@ class ModelLoaderThread(QThread):
 
 
 class InferenceThread(QThread):
-    progress = pyqtSignal(int, int, int, str)  # current, total, percent, message
+    progress = pyqtSignal(int, int, int, str)
     finished_ok = pyqtSignal(list, float)
     failed = pyqtSignal(str)
 
-    def __init__(self, model, processor, device, y16, sr16, gt_rows, whisper_lang_name, mode):
+    def __init__(self, model, processor, device, y16, sr16, gt_rows,
+                 whisper_lang_name, mode, generate_kwargs=None):
         super().__init__()
         self.model = model
         self.processor = processor
@@ -199,6 +356,7 @@ class InferenceThread(QThread):
         self.gt_rows = gt_rows
         self.whisper_lang_name = whisper_lang_name
         self.mode = mode
+        self.generate_kwargs = generate_kwargs or {}
         self._stop_requested = False
 
     def request_stop(self):
@@ -208,29 +366,39 @@ class InferenceThread(QThread):
         if audio_array is None or len(audio_array) == 0:
             return ""
 
+        # Pad very short segments to at least 0.1s
+        min_len = int(0.1 * self.sr16)
+        if len(audio_array) < min_len:
+            audio_array = np.pad(audio_array, (0, min_len - len(audio_array)))
+
         inputs = self.processor(
             audio_array,
             sampling_rate=self.sr16,
             return_tensors="pt",
-            return_attention_mask=True
+            return_attention_mask=True,
         )
 
         input_features = inputs.input_features.to(self.device)
-        attention_mask = None
-        if hasattr(inputs, "attention_mask") and inputs.attention_mask is not None:
-            attention_mask = inputs.attention_mask.to(self.device)
+        attention_mask = getattr(inputs, "attention_mask", None)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+
+        gen_kwargs = {
+            "input_features": input_features,
+            "task": "transcribe",
+            "language": self.whisper_lang_name,
+            "return_timestamps": False,
+        }
+        if attention_mask is not None:
+            gen_kwargs["attention_mask"] = attention_mask
+
+        gen_kwargs.update(self.generate_kwargs)
 
         with torch.inference_mode():
-            predicted_ids = self.model.generate(
-                input_features=input_features,
-                attention_mask=attention_mask,
-                task="transcribe",
-                language=self.whisper_lang_name
-            )
+            predicted_ids = self.model.generate(**gen_kwargs)
 
         text = self.processor.batch_decode(
-            predicted_ids,
-            skip_special_tokens=True
+            predicted_ids, skip_special_tokens=True
         )[0]
 
         return clean_prediction(text, mode=self.mode)
@@ -244,21 +412,20 @@ class InferenceThread(QThread):
                 self.finished_ok.emit([], 0.0)
                 return
 
-            log(f"Starting background inference for {total} segments", force=True)
+            log(f"Starting inference for {total} segments "
+                f"(lang={self.whisper_lang_name}, mode={self.mode})", force=True)
 
             for i, row in enumerate(self.gt_rows, start=1):
                 if self._stop_requested:
                     warn("Inference stop requested")
                     break
 
-                s16 = int(row["start"] * self.sr16)
-                e16 = int(row["end"] * self.sr16)
-                s16 = max(0, s16)
-                e16 = min(len(self.y16), e16)
+                s16 = max(0, int(row["start"] * self.sr16))
+                e16 = min(len(self.y16), int(row["end"] * self.sr16))
 
-                chunk16 = self.y16[s16:e16]
-                pred = self.transcribe_segment(chunk16)
-                score = simple_match(pred, row["label"])
+                chunk = self.y16[s16:e16]
+                pred = self.transcribe_segment(chunk)
+                acc = compute_accuracy(pred, row["label"])
 
                 results.append({
                     "gt": row["label"],
@@ -267,29 +434,47 @@ class InferenceThread(QThread):
                     "gt_end": row["end"],
                     "pred_start": row["start"],
                     "pred_end": row["end"],
-                    "score": score,
+                    "score": acc,
                 })
 
-                percent = int((i / total) * 100)
-                msg = f"{i}/{total} | XLSX='{row['label']}' | MODEL='{pred}' | score={score:.3f}"
-                self.progress.emit(i, total, percent, msg)
+                pct = int((i / total) * 100)
+                msg = (f"{i}/{total} | GT='{row['label']}' | PRED='{pred}' "
+                       f"| acc={acc:.3f}")
+                self.progress.emit(i, total, pct, msg)
 
-                if i == 1 or i % 5 == 0 or i == total:
-                    log(msg, force=True)
-
-            mean_score = np.mean([r["score"] for r in results]) if results else 0.0
-            self.finished_ok.emit(results, float(mean_score))
+            mean_acc = np.mean([r["score"] for r in results]) if results else 0.0
+            self.finished_ok.emit(results, float(mean_acc))
 
         except Exception as e:
             traceback.print_exc()
             self.failed.emit(str(e))
 
 
+class SegmentationThread(QThread):
+    finished_ok = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, y, sr, params):
+        super().__init__()
+        self.y = y
+        self.sr = sr
+        self.params = params
+
+    def run(self):
+        try:
+            segs = vad_segment_audio(self.y, self.sr, **self.params)
+            self.finished_ok.emit(segs)
+        except Exception as e:
+            traceback.print_exc()
+            self.failed.emit(str(e))
+
+
+# ── Main Window ───────────────────────────────────────────────────────────
 class ProfessionalAnnotationTool(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Professional Indic Annotation Tool")
-        self.resize(1650, 980)
+        self.setWindowTitle("Indic Language Annotation & Segmentation Tool")
+        self.resize(1700, 1000)
 
         self.audio_path = None
         self.xlsx_path = None
@@ -312,6 +497,7 @@ class ProfessionalAnnotationTool(QMainWindow):
 
         self.model_thread = None
         self.infer_thread = None
+        self.seg_thread = None
         self.is_inference_running = False
 
         self.font_cache = {
@@ -324,16 +510,25 @@ class ProfessionalAnnotationTool(QMainWindow):
         self._build_ui()
         log("Application ready", force=True)
 
+    # ── UI Construction ───────────────────────────────────────────────────
     def _build_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
         root_layout = QVBoxLayout(root)
+        root_layout.setSpacing(4)
+        root_layout.setContentsMargins(8, 8, 8, 8)
 
-        menu_row_1 = QHBoxLayout()
+        # ── Row 1: Language, Model, Mode, Load buttons ────────────────────
+        row1 = QHBoxLayout()
 
         self.lang_combo = QComboBox()
-        for label, lang_code, whisper_lang in LANG_OPTIONS:
-            self.lang_combo.addItem(label, (lang_code, whisper_lang))
+        for label, code, wname in LANG_OPTIONS:
+            self.lang_combo.addItem(label, (code, wname))
+
+        self.model_combo = QComboBox()
+        for label, mid in MODEL_OPTIONS:
+            self.model_combo.addItem(label, mid)
+        self.model_combo.setCurrentIndex(2)  # Default: large-v3
 
         self.mode_combo = QComboBox()
         for label, mode in PREDICTION_MODES:
@@ -348,24 +543,27 @@ class ProfessionalAnnotationTool(QMainWindow):
         self.load_model_btn = QPushButton("Load Model")
         self.load_model_btn.clicked.connect(self.load_model)
 
+        for w in [
+            QLabel("Language:"), self.lang_combo,
+            QLabel("Model:"),    self.model_combo,
+            QLabel("Mode:"),     self.mode_combo,
+            self.load_audio_btn, self.load_gt_btn, self.load_model_btn,
+        ]:
+            row1.addWidget(w)
+        row1.addStretch()
+
+        # ── Row 2: Actions ────────────────────────────────────────────────
+        row2 = QHBoxLayout()
+
         self.run_btn = QPushButton("Run Prediction")
         self.run_btn.clicked.connect(self.run_inference)
 
-        for w in [
-            QLabel("Language"),
-            self.lang_combo,
-            QLabel("Prediction"),
-            self.mode_combo,
-            self.load_audio_btn,
-            self.load_gt_btn,
-            self.load_model_btn,
-            self.run_btn,
-        ]:
-            menu_row_1.addWidget(w)
+        self.stop_infer_btn = QPushButton("Stop Inference")
+        self.stop_infer_btn.clicked.connect(self.stop_inference)
+        self.stop_infer_btn.setEnabled(False)
 
-        menu_row_1.addStretch()
-
-        menu_row_2 = QHBoxLayout()
+        self.auto_seg_btn = QPushButton("Auto-Segment (VAD)")
+        self.auto_seg_btn.clicked.connect(self.run_auto_segmentation)
 
         self.play_audio_btn = QPushButton("Play Audio")
         self.play_audio_btn.clicked.connect(self.play_audio)
@@ -373,7 +571,7 @@ class ProfessionalAnnotationTool(QMainWindow):
         self.play_segment_btn = QPushButton("Play Segment")
         self.play_segment_btn.clicked.connect(self.play_selected_segment)
 
-        self.stop_btn = QPushButton("Stop")
+        self.stop_btn = QPushButton("Stop Playback")
         self.stop_btn.clicked.connect(self.stop_audio)
 
         self.zoom_in_btn = QPushButton("Zoom In")
@@ -389,20 +587,17 @@ class ProfessionalAnnotationTool(QMainWindow):
         self.export_btn.clicked.connect(self.export_csv)
 
         for w in [
-            self.play_audio_btn,
-            self.play_segment_btn,
-            self.stop_btn,
-            self.zoom_in_btn,
-            self.zoom_out_btn,
-            self.reset_view_btn,
+            self.run_btn, self.stop_infer_btn, self.auto_seg_btn,
+            self.play_audio_btn, self.play_segment_btn, self.stop_btn,
+            self.zoom_in_btn, self.zoom_out_btn, self.reset_view_btn,
             self.export_btn,
         ]:
-            menu_row_2.addWidget(w)
+            row2.addWidget(w)
+        row2.addStretch()
 
-        menu_row_2.addStretch()
-
+        # ── Status & progress ─────────────────────────────────────────────
         self.status_label = QLabel("Load audio and ground truth to begin.")
-        self.status_label.setStyleSheet("padding: 6px; font-size: 13px;")
+        self.status_label.setStyleSheet("padding: 4px; font-size: 13px;")
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
@@ -412,109 +607,138 @@ class ProfessionalAnnotationTool(QMainWindow):
         self.progress_bar.setFixedHeight(18)
         self.progress_bar.setStyleSheet("""
             QProgressBar {
-                border: 1px solid #cfcfcf;
-                border-radius: 4px;
-                background: #f3f4f6;
-                text-align: center;
-                font-size: 11px;
+                border: 1px solid #cfcfcf; border-radius: 4px;
+                background: #f3f4f6; text-align: center; font-size: 11px;
             }
             QProgressBar::chunk {
-                background-color: #3b82f6;
-                border-radius: 4px;
+                background-color: #3b82f6; border-radius: 4px;
             }
         """)
 
-        self.fig, self.ax = plt.subplots(figsize=(14, 6))
+        # ── Matplotlib canvas ─────────────────────────────────────────────
+        self.fig, self.ax = plt.subplots(figsize=(14, 5))
         self.canvas = FigureCanvas(self.fig)
         self.toolbar = NavigationToolbar(self.canvas, self)
         self.canvas.mpl_connect("scroll_event", self.on_scroll)
 
+        # ── Right panel: tabs for segments + VAD settings ─────────────────
         self.segment_list = QListWidget()
         self.segment_list.itemClicked.connect(self.on_segment_clicked)
         self.segment_list.setStyleSheet("""
             QListWidget {
-                background-color: #ffffff;
-                border: 1px solid #d0d0d0;
+                background-color: #ffffff; border: 1px solid #d0d0d0;
                 font-size: 12px;
             }
-            QListWidget::item {
-                padding: 4px;
-                margin: 2px;
-            }
+            QListWidget::item { padding: 4px; margin: 2px; }
             QListWidget::item:selected {
-                background: #dbeafe;
-                border: 1px solid #60a5fa;
+                background: #dbeafe; border: 1px solid #60a5fa;
             }
         """)
 
+        # VAD settings panel
+        vad_group = QGroupBox("VAD Segmentation Settings")
+        vad_layout = QVBoxLayout(vad_group)
+
+        self.vad_silence_ms = QSpinBox()
+        self.vad_silence_ms.setRange(50, 2000)
+        self.vad_silence_ms.setValue(300)
+        self.vad_silence_ms.setSuffix(" ms")
+
+        self.vad_thresh_db = QDoubleSpinBox()
+        self.vad_thresh_db.setRange(-80, 0)
+        self.vad_thresh_db.setValue(-40)
+        self.vad_thresh_db.setSuffix(" dB")
+
+        self.vad_min_seg_ms = QSpinBox()
+        self.vad_min_seg_ms.setRange(50, 5000)
+        self.vad_min_seg_ms.setValue(200)
+        self.vad_min_seg_ms.setSuffix(" ms")
+
+        self.vad_max_seg_ms = QSpinBox()
+        self.vad_max_seg_ms.setRange(1000, 30000)
+        self.vad_max_seg_ms.setValue(10000)
+        self.vad_max_seg_ms.setSuffix(" ms")
+
+        for label_text, widget in [
+            ("Min silence duration:", self.vad_silence_ms),
+            ("Silence threshold:",    self.vad_thresh_db),
+            ("Min segment duration:", self.vad_min_seg_ms),
+            ("Max segment duration:", self.vad_max_seg_ms),
+        ]:
+            h = QHBoxLayout()
+            h.addWidget(QLabel(label_text))
+            h.addWidget(widget)
+            vad_layout.addLayout(h)
+
+        vad_layout.addStretch()
+
+        # Tab widget
+        right_tabs = QTabWidget()
+
+        seg_tab = QWidget()
+        seg_layout = QVBoxLayout(seg_tab)
+
+        legend = QLabel(
+            '<span style="color:green; font-weight:600;">GT (XLSX)</span>  |  '
+            '<span style="color:blue; font-weight:600;">MODEL</span>  |  '
+            '<span style="color:orange; font-weight:600;">VAD</span>'
+        )
+        legend.setTextFormat(Qt.RichText)
+        seg_layout.addWidget(legend)
+        seg_layout.addWidget(self.segment_list)
+
+        right_tabs.addTab(seg_tab, "Segments")
+        right_tabs.addTab(vad_group, "VAD Settings")
+
+        # ── Splitter ──────────────────────────────────────────────────────
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.addWidget(self.toolbar)
         left_layout.addWidget(self.canvas)
 
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-
-        seg_head = QLabel("Segments")
-        seg_head.setStyleSheet("font-weight: bold; font-size: 13px;")
-        self.legend_label = QLabel(
-            '<span style="color: green; font-weight: 600;">XLSX</span>  |  '
-            '<span style="color: blue; font-weight: 600;">MODEL</span>'
-        )
-        self.legend_label.setTextFormat(Qt.RichText)
-
-        right_layout.addWidget(seg_head)
-        right_layout.addWidget(self.legend_label)
-        right_layout.addWidget(self.segment_list)
-
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(left_panel)
-        splitter.addWidget(right_panel)
-        splitter.setSizes([1250, 350])
+        splitter.addWidget(right_tabs)
+        splitter.setSizes([1250, 400])
 
-        root_layout.addLayout(menu_row_1)
-        root_layout.addLayout(menu_row_2)
+        # ── Assemble ──────────────────────────────────────────────────────
+        root_layout.addLayout(row1)
+        root_layout.addLayout(row2)
         root_layout.addWidget(self.status_label)
         root_layout.addWidget(self.progress_bar)
         root_layout.addWidget(splitter)
 
+    # ── Helpers ───────────────────────────────────────────────────────────
     def set_ui_busy(self, busy: bool, msg: str = ""):
-        self.load_audio_btn.setEnabled(not busy)
-        self.load_gt_btn.setEnabled(not busy)
-        self.load_model_btn.setEnabled(not busy)
-        self.run_btn.setEnabled(not busy)
-        self.lang_combo.setEnabled(not busy)
-        self.mode_combo.setEnabled(not busy)
+        for w in [
+            self.load_audio_btn, self.load_gt_btn, self.load_model_btn,
+            self.run_btn, self.lang_combo, self.mode_combo, self.model_combo,
+            self.auto_seg_btn, self.play_audio_btn, self.play_segment_btn,
+            self.export_btn,
+        ]:
+            w.setEnabled(not busy)
 
-        self.play_audio_btn.setEnabled(not busy)
-        self.play_segment_btn.setEnabled(not busy)
-        self.export_btn.setEnabled(not busy)
+        self.stop_infer_btn.setEnabled(busy)
 
         if msg:
             self.status_label.setText(msg)
 
     def build_plot_cache(self):
         if self.y is None or self.sr is None:
-            self.wave_t_plot = None
-            self.wave_y_plot = None
+            self.wave_t_plot = self.wave_y_plot = None
             return
 
-        max_points = 20000
+        max_points = 25000
         step = max(1, len(self.y) // max_points)
-        y_plot = self.y[::step]
-        t_plot = np.arange(len(y_plot)) * step / self.sr
+        self.wave_y_plot = self.y[::step]
+        self.wave_t_plot = np.arange(len(self.wave_y_plot)) * step / self.sr
+        log(f"Waveform cache: {len(self.wave_y_plot)} points", force=True)
 
-        self.wave_t_plot = t_plot
-        self.wave_y_plot = y_plot
-
-        log(f"Waveform cache built with {len(y_plot)} points", force=True)
-
+    # ── Load Audio ────────────────────────────────────────────────────────
     def load_audio(self):
         path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open Audio",
-            "",
-            "Audio Files (*.wav *.mp3 *.flac *.ogg *.m4a)"
+            self, "Open Audio", "",
+            "Audio Files (*.wav *.mp3 *.flac *.ogg *.m4a *.webm)"
         )
         if not path:
             return
@@ -523,7 +747,6 @@ class ProfessionalAnnotationTool(QMainWindow):
             self.status_label.setText("Loading audio...")
             QApplication.processEvents()
 
-            log(f"Loading audio: {path}", force=True)
             self.y, self.sr = librosa.load(path, sr=None, mono=True)
             self.y16 = librosa.resample(self.y, orig_sr=self.sr, target_sr=self.sr16)
 
@@ -531,13 +754,12 @@ class ProfessionalAnnotationTool(QMainWindow):
             self.results = []
             self.selected_index = None
             self.progress_bar.setValue(0)
-
             self.build_plot_cache()
 
-            duration = len(self.y) / self.sr if self.sr else 0.0
-            log(f"Audio loaded | sr={self.sr} | duration={duration:.2f}s | sr16={self.sr16}", force=True)
-
-            self.status_label.setText(f"Loaded audio: {os.path.basename(path)}")
+            dur = len(self.y) / self.sr
+            self.status_label.setText(
+                f"Audio: {os.path.basename(path)} | {dur:.1f}s | sr={self.sr}"
+            )
             self.refresh_segment_list()
             self.redraw_plot()
 
@@ -545,40 +767,32 @@ class ProfessionalAnnotationTool(QMainWindow):
             traceback.print_exc()
             QMessageBox.critical(self, "Audio Load Error", str(e))
 
+    # ── Load Ground Truth ─────────────────────────────────────────────────
     def load_gt(self):
         path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open Ground Truth",
-            "",
-            "Excel Files (*.xlsx)"
+            self, "Open Ground Truth", "",
+            "Excel Files (*.xlsx);;CSV Files (*.csv)"
         )
         if not path:
             return
 
         try:
-            log(f"Loading ground truth: {path}", force=True)
-            df = pd.read_excel(path, sheet_name=0, header=None, engine="openpyxl")
+            if path.endswith(".csv"):
+                df = pd.read_csv(path, header=None)
+            else:
+                df = pd.read_excel(path, sheet_name=0, header=None, engine="openpyxl")
 
-            rows = []
-            skipped = 0
-
+            rows, skipped = [], 0
             for _, r in df.iterrows():
-                label = str(r[0]).strip()
-                start = time_to_sec(r[1])
-                end = time_to_sec(r[2])
+                label = str(r.iloc[0]).strip()
+                start = time_to_sec(r.iloc[1])
+                end   = time_to_sec(r.iloc[2])
 
-                if not label or start is None or end is None:
-                    skipped += 1
-                    continue
-                if end <= start:
+                if not label or start is None or end is None or end <= start:
                     skipped += 1
                     continue
 
-                rows.append({
-                    "label": label,
-                    "start": start,
-                    "end": end,
-                })
+                rows.append({"label": label, "start": start, "end": end})
 
             self.gt_rows = rows
             self.xlsx_path = path
@@ -586,9 +800,9 @@ class ProfessionalAnnotationTool(QMainWindow):
             self.selected_index = None
             self.progress_bar.setValue(0)
 
-            log(f"GT rows loaded: {len(rows)} | skipped={skipped}", force=True)
-
-            self.status_label.setText(f"Loaded GT rows: {len(rows)}")
+            self.status_label.setText(
+                f"GT loaded: {len(rows)} segments (skipped {skipped})"
+            )
             self.refresh_segment_list()
             self.redraw_plot()
 
@@ -596,13 +810,15 @@ class ProfessionalAnnotationTool(QMainWindow):
             traceback.print_exc()
             QMessageBox.critical(self, "GT Load Error", str(e))
 
+    # ── Load Model ────────────────────────────────────────────────────────
     def load_model(self):
-        if self.model_thread is not None and self.model_thread.isRunning():
-            warn("Model loading is already running")
+        if self.model_thread and self.model_thread.isRunning():
             return
 
-        self.set_ui_busy(True, "Loading Whisper model...")
-        self.model_thread = ModelLoaderThread()
+        model_id = self.model_combo.currentData()
+        self.set_ui_busy(True, f"Loading {model_id}...")
+
+        self.model_thread = ModelLoaderThread(model_id)
         self.model_thread.finished_ok.connect(self.on_model_loaded)
         self.model_thread.failed.connect(self.on_model_load_failed)
         self.model_thread.start()
@@ -611,120 +827,144 @@ class ProfessionalAnnotationTool(QMainWindow):
         self.model = model
         self.processor = processor
         self.device = device
-
-        log(f"Model loaded successfully on {device}", force=True)
-        self.set_ui_busy(False, "Model loaded successfully.")
+        self.set_ui_busy(False, f"Model loaded on {device}.")
 
     def on_model_load_failed(self, message):
-        err(f"Model load failed: {message}")
         self.set_ui_busy(False, "Model load failed.")
         QMessageBox.critical(self, "Model Load Error", message)
 
-    def run_inference(self):
-        if self.audio_path is None or self.y is None or self.y16 is None:
-            QMessageBox.warning(self, "Missing Audio", "Load audio first.")
+    # ── Auto Segmentation (VAD) ───────────────────────────────────────────
+    def run_auto_segmentation(self):
+        if self.y is None:
+            QMessageBox.warning(self, "No Audio", "Load audio first.")
             return
 
-        if not self.gt_rows:
-            QMessageBox.warning(self, "Missing GT", "Load ground truth first.")
-            return
+        params = {
+            "min_silence_ms":  self.vad_silence_ms.value(),
+            "silence_thresh_db": self.vad_thresh_db.value(),
+            "min_segment_ms":  self.vad_min_seg_ms.value(),
+            "max_segment_ms":  self.vad_max_seg_ms.value(),
+        }
 
-        if self.model is None or self.processor is None:
-            QMessageBox.warning(self, "Missing Model", "Load the model first.")
-            return
+        self.set_ui_busy(True, "Running VAD segmentation...")
+        self.seg_thread = SegmentationThread(self.y, self.sr, params)
+        self.seg_thread.finished_ok.connect(self.on_segmentation_done)
+        self.seg_thread.failed.connect(self.on_segmentation_failed)
+        self.seg_thread.start()
 
-        if self.infer_thread is not None and self.infer_thread.isRunning():
-            warn("Inference is already running")
-            return
-
-        _, whisper_lang_name = self.lang_combo.currentData()
-        mode = self.mode_combo.currentData()
-
+    def on_segmentation_done(self, segments):
+        # Convert VAD segments to gt_rows format (label = segment index)
+        self.gt_rows = [
+            {
+                "label": f"seg_{i+1:04d}",
+                "start": s["start"],
+                "end":   s["end"],
+            }
+            for i, s in enumerate(segments)
+        ]
         self.results = []
+        self.selected_index = None
+        self.set_ui_busy(False, f"VAD found {len(segments)} segments.")
         self.refresh_segment_list()
         self.redraw_plot()
 
+    def on_segmentation_failed(self, message):
+        self.set_ui_busy(False, "Segmentation failed.")
+        QMessageBox.critical(self, "Segmentation Error", message)
+
+    # ── Inference ─────────────────────────────────────────────────────────
+    def run_inference(self):
+        if self.y is None or self.y16 is None:
+            QMessageBox.warning(self, "Missing Audio", "Load audio first.")
+            return
+        if not self.gt_rows:
+            QMessageBox.warning(self, "Missing Segments",
+                                "Load ground truth or run auto-segmentation.")
+            return
+        if self.model is None:
+            QMessageBox.warning(self, "Missing Model", "Load the model first.")
+            return
+        if self.infer_thread and self.infer_thread.isRunning():
+            return
+
+        _, whisper_lang = self.lang_combo.currentData()
+        mode = self.mode_combo.currentData()
+
+        self.results = []
         self.is_inference_running = True
         self.progress_bar.setValue(0)
-        self.set_ui_busy(True, "Running prediction in background...")
+        self.set_ui_busy(True, "Running prediction...")
 
         self.infer_thread = InferenceThread(
-            model=self.model,
-            processor=self.processor,
-            device=self.device,
-            y16=self.y16,
-            sr16=self.sr16,
-            gt_rows=self.gt_rows,
-            whisper_lang_name=whisper_lang_name,
-            mode=mode
+            self.model, self.processor, self.device,
+            self.y16, self.sr16, self.gt_rows,
+            whisper_lang, mode,
         )
         self.infer_thread.progress.connect(self.on_inference_progress)
         self.infer_thread.finished_ok.connect(self.on_inference_finished)
         self.infer_thread.failed.connect(self.on_inference_failed)
         self.infer_thread.start()
 
-    def on_inference_progress(self, i, total, percent, msg):
-        self.status_label.setText(f"Running prediction... {i}/{total}")
-        self.progress_bar.setValue(percent)
-        log(msg, force=True)
+    def stop_inference(self):
+        if self.infer_thread and self.infer_thread.isRunning():
+            self.infer_thread.request_stop()
+            self.status_label.setText("Stopping inference...")
 
-    def on_inference_finished(self, results, mean_score):
+    def on_inference_progress(self, i, total, pct, msg):
+        self.status_label.setText(f"Predicting... {i}/{total}")
+        self.progress_bar.setValue(pct)
+
+    def on_inference_finished(self, results, mean_acc):
         self.results = results
         self.is_inference_running = False
-
-        log(f"Inference finished | mean_score={mean_score:.3f}", force=True)
-
         self.progress_bar.setValue(100)
-        self.set_ui_busy(False, f"Done. Segments={len(results)} | Mean match={mean_score:.3f}")
+        self.set_ui_busy(
+            False,
+            f"Done. {len(results)} segments | Mean accuracy: {mean_acc:.3f}"
+        )
         self.refresh_segment_list()
         self.redraw_plot()
 
     def on_inference_failed(self, message):
         self.is_inference_running = False
-        err(f"Inference failed: {message}")
         self.progress_bar.setValue(0)
         self.set_ui_busy(False, "Inference failed.")
         QMessageBox.critical(self, "Inference Error", message)
 
-    def _draw_label(self, x, ymax, gt_text=None, pred_text=None, gt_time=None, pred_time=None, lang_code="hi"):
-        font_prop = self.font_cache.get(lang_code, None)
+    # ── Plot ──────────────────────────────────────────────────────────────
+    def _draw_label(self, x, ymax, gt_text=None, pred_text=None,
+                    gt_time=None, pred_time=None, lang_code="hi"):
+        fp = self.font_cache.get(lang_code)
+        kwargs = {"fontproperties": fp} if fp else {}
 
-        y1 = ymax * 0.95
-        y2 = ymax * 0.84
-        y3 = ymax * 0.72
-        y4 = ymax * 0.61
+        positions = [0.95, 0.84, 0.72, 0.61]
 
         if gt_text:
             self.ax.text(
-                x, y1, f"XLSX: {gt_text}",
-                ha="center", va="bottom",
-                fontsize=10, color="green",
-                fontproperties=font_prop, fontweight="bold",
-                bbox=dict(facecolor="black", alpha=0.18, edgecolor="none", pad=2)
+                x, ymax * positions[0], f"GT: {gt_text}",
+                ha="center", va="bottom", fontsize=10, color="green",
+                fontweight="bold",
+                bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=2),
+                **kwargs,
             )
-
         if gt_time:
             self.ax.text(
-                x, y2, f"XLSX Time: {gt_time}",
-                ha="center", va="bottom",
-                fontsize=8, color="green"
+                x, ymax * positions[1], gt_time,
+                ha="center", va="bottom", fontsize=8, color="green",
             )
-
         if pred_text is not None:
-            shown_pred = pred_text if pred_text != "" else "∅"
+            shown = pred_text if pred_text else "∅"
             self.ax.text(
-                x, y3, f"MODEL: {shown_pred}",
-                ha="center", va="bottom",
-                fontsize=10, color="blue",
-                fontproperties=font_prop, fontweight="bold",
-                bbox=dict(facecolor="black", alpha=0.18, edgecolor="none", pad=2)
+                x, ymax * positions[2], f"PRED: {shown}",
+                ha="center", va="bottom", fontsize=10, color="blue",
+                fontweight="bold",
+                bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=2),
+                **kwargs,
             )
-
         if pred_time:
             self.ax.text(
-                x, y4, f"MODEL Time: {pred_time}",
-                ha="center", va="bottom",
-                fontsize=8, color="blue"
+                x, ymax * positions[3], pred_time,
+                ha="center", va="bottom", fontsize=8, color="blue",
             )
 
     def redraw_plot(self):
@@ -734,24 +974,17 @@ class ProfessionalAnnotationTool(QMainWindow):
             self.canvas.draw_idle()
             return
 
-        self.ax.plot(self.wave_t_plot, self.wave_y_plot, linewidth=0.7, color="black")
+        self.ax.plot(self.wave_t_plot, self.wave_y_plot, lw=0.6, color="black")
 
         ymax = np.max(np.abs(self.wave_y_plot)) if len(self.wave_y_plot) else 1.0
-        if ymax == 0:
-            ymax = 1.0
+        ymax = max(ymax, 1e-6)
 
         lang_code, _ = self.lang_combo.currentData()
 
         data = self.results if self.results else [
-            {
-                "gt": r["label"],
-                "pred": None,
-                "gt_start": r["start"],
-                "gt_end": r["end"],
-                "pred_start": None,
-                "pred_end": None,
-                "score": None,
-            }
+            {"gt": r["label"], "pred": None,
+             "gt_start": r["start"], "gt_end": r["end"],
+             "pred_start": None, "pred_end": None, "score": None}
             for r in self.gt_rows
         ]
 
@@ -759,101 +992,80 @@ class ProfessionalAnnotationTool(QMainWindow):
             s, e = r["gt_start"], r["gt_end"]
 
             if self.results:
-                color = "green" if r["score"] is not None and r["score"] >= 0.99 else "red"
+                color = "green" if r["score"] is not None and r["score"] >= 0.95 else "red"
             else:
                 color = "green"
 
-            self.ax.axvspan(s, e, alpha=0.12, color=color)
-            self.ax.axvline(s, linewidth=0.8, color=color)
-            self.ax.axvline(e, linewidth=0.8, color=color)
+            self.ax.axvspan(s, e, alpha=0.10, color=color)
+            self.ax.axvline(s, lw=0.6, color=color, alpha=0.5)
+            self.ax.axvline(e, lw=0.6, color=color, alpha=0.5)
 
             if self.selected_index is not None and idx == self.selected_index:
-                self.ax.axvspan(s, e, alpha=0.20, color="yellow")
+                self.ax.axvspan(s, e, alpha=0.25, color="yellow")
 
+        # Draw labels for selected segment
         if self.selected_index is not None and 0 <= self.selected_index < len(data):
             r = data[self.selected_index]
             mid = (r["gt_start"] + r["gt_end"]) / 2
-            gt_time = f"[{r['gt_start']:.2f}-{r['gt_end']:.2f}]"
+            gt_time = f"[{r['gt_start']:.2f}–{r['gt_end']:.2f}]"
             pred_time = None
-            if r["pred_start"] is not None and r["pred_end"] is not None:
-                pred_time = f"[{r['pred_start']:.2f}-{r['pred_end']:.2f}]"
+            if r.get("pred_start") is not None:
+                pred_time = f"[{r['pred_start']:.2f}–{r['pred_end']:.2f}]"
 
             self._draw_label(
-                x=mid,
-                ymax=ymax,
-                gt_text=r["gt"],
-                pred_text=r["pred"],
-                gt_time=gt_time,
-                pred_time=pred_time,
-                lang_code=lang_code,
+                mid, ymax, r["gt"], r.get("pred"),
+                gt_time, pred_time, lang_code,
             )
 
         title = "Waveform"
         if self.results:
-            mean_score = np.mean([r["score"] for r in self.results]) if self.results else 0.0
-            title = f"Waveform | mean match={mean_score:.3f}"
-
+            mean = np.mean([r["score"] for r in self.results])
+            title = f"Waveform | Mean Accuracy = {mean:.3f}"
         self.ax.set_title(title)
         self.ax.set_xlabel("Time (s)")
         self.ax.set_ylabel("Amplitude")
+        self.fig.tight_layout()
         self.canvas.draw_idle()
 
+    # ── Segment List ──────────────────────────────────────────────────────
     def _make_segment_widget(self, idx, r):
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(6, 4, 6, 4)
-        layout.setSpacing(2)
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(6, 3, 6, 3)
+        layout.setSpacing(1)
 
-        gt = html.escape(str(r.get("gt", "")))
-        pred_val = r.get("pred", "")
-        pred = html.escape(str(pred_val if pred_val != "" else "∅"))
-
-        time_line = f"{r.get('gt_start', 0):.2f}-{r.get('gt_end', 0):.2f}"
-        score = r.get("score", None)
+        gt   = html.escape(str(r.get("gt", "")))
+        pred = html.escape(str(r.get("pred", "") or "∅"))
+        time_str = f"{r.get('gt_start', 0):.2f}–{r.get('gt_end', 0):.2f}s"
+        score = r.get("score")
 
         if score is None:
-            score_html = '<span style="color:#6b7280;">score=NA</span>'
+            score_html = '<span style="color:#9ca3af;">—</span>'
         else:
-            score_color = "#16a34a" if score >= 0.99 else "#dc2626"
-            score_html = f'<span style="color:{score_color};">score={score:.2f}</span>'
+            c = "#16a34a" if score >= 0.95 else ("#f59e0b" if score >= 0.5 else "#dc2626")
+            score_html = f'<span style="color:{c}; font-weight:600;">{score:.2f}</span>'
 
         top = QLabel(
-            f'<span style="color:#111827; font-weight:600;">{idx+1:02d}</span> | '
-            f'<span style="color:green; font-weight:600;">XLSX:</span> '
-            f'<span style="color:green;">{gt}</span>'
+            f'<b>{idx+1:03d}</b> '
+            f'<span style="color:green;">GT: {gt}</span> → '
+            f'<span style="color:blue;">PRED: {pred}</span>'
         )
         top.setTextFormat(Qt.RichText)
         top.setWordWrap(True)
 
-        mid = QLabel(
-            f'<span style="color:blue; font-weight:600;">MODEL:</span> '
-            f'<span style="color:blue;">{pred}</span>'
-        )
-        mid.setTextFormat(Qt.RichText)
-        mid.setWordWrap(True)
-
-        bottom = QLabel(
-            f'<span style="color:#6b7280;">{time_line}</span> | {score_html}'
-        )
+        bottom = QLabel(f'{time_str} | Acc: {score_html}')
         bottom.setTextFormat(Qt.RichText)
-        bottom.setWordWrap(True)
 
         layout.addWidget(top)
-        layout.addWidget(mid)
         layout.addWidget(bottom)
-        return widget
+        return w
 
     def refresh_segment_list(self):
         self.segment_list.clear()
 
         source = self.results if self.results else [
-            {
-                "gt": r["label"],
-                "pred": "",
-                "gt_start": r["start"],
-                "gt_end": r["end"],
-                "score": None,
-            }
+            {"gt": r["label"], "pred": "",
+             "gt_start": r["start"], "gt_end": r["end"], "score": None}
             for r in self.gt_rows
         ]
 
@@ -870,79 +1082,49 @@ class ProfessionalAnnotationTool(QMainWindow):
         self.selected_index = idx
 
         source = self.results if self.results else [
-            {
-                "gt_start": r["start"],
-                "gt_end": r["end"],
-            }
+            {"gt_start": r["start"], "gt_end": r["end"]}
             for r in self.gt_rows
         ]
+        if 0 <= idx < len(source):
+            s, e = source[idx]["gt_start"], source[idx]["gt_end"]
+            pad = max(0.3, (e - s) * 0.2)
+            self.ax.set_xlim(max(0, s - pad), e + pad)
+            self.redraw_plot()
 
-        if idx < 0 or idx >= len(source):
-            return
-
-        s = source[idx]["gt_start"]
-        e = source[idx]["gt_end"]
-
-        pad = 0.3
-        self.ax.set_xlim(max(0, s - pad), e + pad)
-        self.redraw_plot()
-
+    # ── Audio Playback ────────────────────────────────────────────────────
     def play_audio(self):
-        if self.y is None or self.sr is None:
-            return
-        log("Playing full audio", force=True)
-        sd.stop()
-        sd.play(self.y, self.sr)
+        if self.y is not None and self.sr:
+            sd.stop()
+            sd.play(self.y, self.sr)
 
     def play_selected_segment(self):
         if self.selected_index is None:
-            QMessageBox.warning(self, "No Segment", "Select a segment from the side panel.")
+            QMessageBox.warning(self, "No Segment", "Select a segment first.")
             return
 
         source = self.results if self.results else [
-            {
-                "gt_start": r["start"],
-                "gt_end": r["end"],
-            }
+            {"gt_start": r["start"], "gt_end": r["end"]}
             for r in self.gt_rows
         ]
-
-        if self.selected_index < 0 or self.selected_index >= len(source):
-            return
-
-        s = source[self.selected_index]["gt_start"]
-        e = source[self.selected_index]["gt_end"]
-        self.play_time_range(s, e)
-
-    def play_time_range(self, start_sec, end_sec):
-        if self.y is None or self.sr is None:
-            return
-        s = int(start_sec * self.sr)
-        e = int(end_sec * self.sr)
-        log(f"Playing segment {start_sec:.2f}-{end_sec:.2f}s", force=True)
-        sd.stop()
-        sd.play(self.y[s:e], self.sr)
+        if 0 <= self.selected_index < len(source):
+            s = source[self.selected_index]["gt_start"]
+            e = source[self.selected_index]["gt_end"]
+            si, ei = int(s * self.sr), int(e * self.sr)
+            sd.stop()
+            sd.play(self.y[si:ei], self.sr)
 
     def stop_audio(self):
-        log("Stopping audio playback", force=True)
         sd.stop()
 
+    # ── Zoom ──────────────────────────────────────────────────────────────
     def zoom(self, factor):
-        if self.y is None or self.sr is None:
+        if self.y is None:
             return
-
         x0, x1 = self.ax.get_xlim()
-        center = (x0 + x1) / 2
-        width = (x1 - x0) * factor / 2
-
-        new_x0 = center - width
-        new_x1 = center + width
-
+        c = (x0 + x1) / 2
+        w = (x1 - x0) * factor / 2
         total = len(self.y) / self.sr
-        new_x0 = max(0, new_x0)
-        new_x1 = min(total, new_x1)
-
-        self.ax.set_xlim(new_x0, new_x1)
+        self.ax.set_xlim(max(0, c - w), min(total, c + w))
         self.canvas.draw_idle()
 
     def zoom_in_plot(self):
@@ -952,68 +1134,75 @@ class ProfessionalAnnotationTool(QMainWindow):
         self.zoom(1.4)
 
     def on_scroll(self, event):
-        if self.y is None or self.sr is None:
+        if self.y is None:
             return
-
         x0, x1 = self.ax.get_xlim()
-        mouse_x = event.xdata if event.xdata is not None else (x0 + x1) / 2
-        scale = 0.7 if event.button == "up" else 1.4
-
-        new_x0 = mouse_x - (mouse_x - x0) * scale
-        new_x1 = mouse_x + (x1 - mouse_x) * scale
-
+        mx = event.xdata if event.xdata is not None else (x0 + x1) / 2
+        s = 0.7 if event.button == "up" else 1.4
         total = len(self.y) / self.sr
-        new_x0 = max(0, new_x0)
-        new_x1 = min(total, new_x1)
-
-        self.ax.set_xlim(new_x0, new_x1)
+        self.ax.set_xlim(
+            max(0, mx - (mx - x0) * s),
+            min(total, mx + (x1 - mx) * s),
+        )
         self.canvas.draw_idle()
 
     def reset_plot_view(self):
-        if self.y is None or self.sr is None:
-            return
-        total = len(self.y) / self.sr
-        self.ax.set_xlim(0, total)
-        self.canvas.draw_idle()
+        if self.y is not None and self.sr:
+            self.ax.set_xlim(0, len(self.y) / self.sr)
+            self.canvas.draw_idle()
 
+    # ── Export ────────────────────────────────────────────────────────────
     def export_csv(self):
         if not self.results:
             QMessageBox.warning(self, "No Results", "Run prediction first.")
             return
 
         path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save CSV",
-            "results.csv",
-            "CSV Files (*.csv)"
+            self, "Save CSV", "results.csv", "CSV Files (*.csv)"
         )
         if not path:
             return
 
         try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "gt_from_xlsx", "pred_from_model", "score",
-                    "gt_start", "gt_end",
-                    "pred_start", "pred_end"
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    "index", "ground_truth", "prediction", "accuracy",
+                    "gt_start", "gt_end", "pred_start", "pred_end",
                 ])
-                for r in self.results:
-                    writer.writerow([
-                        r["gt"], r["pred"], r["score"],
-                        r["gt_start"], r["gt_end"],
-                        r["pred_start"], r["pred_end"],
+                for i, r in enumerate(self.results):
+                    w.writerow([
+                        i + 1, r["gt"], r["pred"], f"{r['score']:.4f}",
+                        f"{r['gt_start']:.4f}", f"{r['gt_end']:.4f}",
+                        f"{r['pred_start']:.4f}", f"{r['pred_end']:.4f}",
                     ])
-            self.status_label.setText(f"Exported CSV: {path}")
-            log(f"CSV exported: {path}", force=True)
+            self.status_label.setText(f"Exported: {path}")
         except Exception as e:
             traceback.print_exc()
             QMessageBox.critical(self, "Export Error", str(e))
 
 
+# ── Entry Point ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("[LOG] Launching application", flush=True)
+    print("[LOG] Launching Indic Annotation Tool", flush=True)
     app = QApplication(sys.argv)
+
+    # Global stylesheet
+    app.setStyleSheet("""
+        QPushButton {
+            padding: 5px 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            background: #f9fafb;
+            font-size: 12px;
+        }
+        QPushButton:hover { background: #e5e7eb; }
+        QPushButton:pressed { background: #d1d5db; }
+        QPushButton:disabled { color: #9ca3af; background: #f3f4f6; }
+        QComboBox { padding: 4px 8px; font-size: 12px; }
+        QLabel { font-size: 12px; }
+    """)
+
     w = ProfessionalAnnotationTool()
     w.show()
     sys.exit(app.exec_())
