@@ -29,6 +29,7 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 MODEL_ID = "openai/whisper-small"
 
 LANG_OPTIONS = [
+    ("English", "en", "english"),
     ("Hindi", "hi", "hindi"),
     ("Gujarati", "gu", "gujarati"),
     ("Marathi", "mr", "marathi"),
@@ -93,6 +94,8 @@ def clean_prediction(text: str, mode: str = "word") -> str:
         return ""
 
     text = str(text).strip()
+
+    # Keep English letters/numbers/underscore + spaces + Indic blocks
     text = re.sub(r"[^\w\s\u0900-\u097F\u0A80-\u0AFF]", "", text, flags=re.UNICODE)
     text = re.sub(r"\s+", " ", text).strip()
 
@@ -103,8 +106,9 @@ def clean_prediction(text: str, mode: str = "word") -> str:
         return text.split(" ")[0].strip()
 
     if mode == "char":
-        indic_only = re.sub(r"[^\u0900-\u097F\u0A80-\u0AFF]", "", text)
-        return indic_only[0] if indic_only else ""
+        # Prefer Indic or English alphabetic character only
+        filtered = re.sub(r"[^A-Za-z\u0900-\u097F\u0A80-\u0AFF]", "", text)
+        return filtered[0] if filtered else ""
 
     return text
 
@@ -133,9 +137,14 @@ def pick_font_for_language(lang_code: str):
             "Shruti",
             "Arial Unicode MS",
         ]
-    else:
+    else:  # English and fallback
         candidates = []
-        families = ["Arial Unicode MS"]
+        families = [
+            "Arial",
+            "Helvetica",
+            "Arial Unicode MS",
+            "DejaVu Sans",
+        ]
 
     for path in candidates:
         if os.path.exists(path):
@@ -306,6 +315,7 @@ class ProfessionalAnnotationTool(QMainWindow):
         self.is_inference_running = False
 
         self.font_cache = {
+            "en": pick_font_for_language("en"),
             "hi": pick_font_for_language("hi"),
             "mr": pick_font_for_language("mr"),
             "gu": pick_font_for_language("gu"),
