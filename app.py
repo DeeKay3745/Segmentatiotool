@@ -1,188 +1,215 @@
+#!/usr/bin/env python3
 """
-Indic Language Annotation & Segmentation Tool  ──  ULTRA-FAST Edition
-═══════════════════════════════════════════════════════════════════════
-Speed tiers (vs original HuggingFace code):
+Indic Speech Annotation & Segmentation Tool
+============================================
+Languages : English, Hindi, Gujarati, Marathi
+Engines   : faster-whisper (primary), HuggingFace transformers (fallback)
 
-  whisper.cpp  (int8, 4 threads)  ≈ 25-40× faster
-  faster-whisper (CTranslate2)    ≈  4-8×  faster
-  distil-whisper (HF)             ≈  5-6×  faster
-  HuggingFace (vanilla)           ≈  1×    baseline
+Install:
+    pip install faster-whisper soundfile scipy numpy pandas \
+                matplotlib PyQt5 sounddevice openpyxl
 
-Additional speed features:
-  • Model cache — switching languages doesn't re-download
-  • Auto-preload on launch — model loads while you pick files
-  • Background audio loading — UI never freezes
-  • ThreadPool for segment-level parallelism
-  • Streaming results — see each prediction as it arrives
-  • Vectorised VAD (numpy, no Python loops)
-  • soundfile + scipy resampling
-  • Viewport-culled plotting
-
-Install (pick ONE engine — listed fastest→slowest):
-
-  # Option A: whisper.cpp (FASTEST — pure C++)
-  pip install pywhispercpp soundfile scipy
-
-  # Option B: faster-whisper (CTranslate2 — great balance)
-  pip install faster-whisper soundfile scipy
-
-  # Option C: HuggingFace + distil-whisper (easiest install)
-  pip install transformers torch soundfile scipy
+If faster-whisper is unavailable, install HuggingFace:
+    pip install transformers torch
 """
 
-import os, sys, csv, re, traceback, time
+# ══════════════════════════════════════════════════════════════════════════
+#  IMPORTS
+# ══════════════════════════════════════════════════════════════════════════
+import os
+import sys
+import csv
+import re
+import time
+import traceback
 from datetime import datetime
 from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
 import sounddevice as sd
+
 import matplotlib
 matplotlib.use("QtAgg")
 import matplotlib.pyplot as plt
 from matplotlib import font_manager as fm
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QListWidget, QListWidgetItem, QSplitter, QProgressBar,
-    QGroupBox, QDoubleSpinBox, QSpinBox, QTabWidget, QCheckBox,
+    QGroupBox, QDoubleSpinBox, QSpinBox, QTabWidget,
 )
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 
-# ── Optional fast imports ────────────────────────────────────────────────
-HAS_WHISPERCPP = False
-try:
-    from pywhispercpp.model import Model as WhisperCppModel
-    HAS_WHISPERCPP = True
-except ImportError:
-    pass
-
-HAS_FASTER_WHISPER = False
-try:
-    from faster_whisper import WhisperModel as FasterWhisperModel
-    HAS_FASTER_WHISPER = True
-except ImportError:
-    pass
-
-HAS_HF = False
-try:
-    import torch
-    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
-    HAS_HF = True
-except ImportError:
-    pass
-
-HAS_SOUNDFILE = False
+# ── Optional: fast audio I/O ─────────────────────────────────────────────
 try:
     import soundfile as sf
-    HAS_SOUNDFILE = True
+    _HAS_SF = True
 except ImportError:
-    pass
+    _HAS_SF = False
 
-HAS_SCIPY = False
 try:
     from scipy.signal import resample_poly
     from math import gcd
-    HAS_SCIPY = True
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
+
+# ── Engine availability ──────────────────────────────────────────────────
+_HAS_FASTER_WHISPER = False
+try:
+    from faster_whisper import WhisperModel as _FWModel
+    _HAS_FASTER_WHISPER = True
 except ImportError:
     pass
 
-if not any([HAS_WHISPERCPP, HAS_FASTER_WHISPER, HAS_HF]):
-    raise ImportError(
-        "Install at least one engine:\n"
-        "  pip install pywhispercpp      # fastest\n"
-        "  pip install faster-whisper    # fast + accurate\n"
-        "  pip install transformers torch  # baseline"
-    )
+_HAS_HF = False
+try:
+    import torch
+    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+    _HAS_HF = True
+except ImportError:
+    pass
+
+if not _HAS_FASTER_WHISPER and not _HAS_HF:
+    print("ERROR: Install at least one engine:")
+    print("  pip install faster-whisper        # recommended")
+    print("  pip install transformers torch     # fallback")
+    sys.exit(1)
+
 
 # ══════════════════════════════════════════════════════════════════════════
-#  CONSTANTS & CONFIG
+#  CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════
 
-# (UI label, HF model ID, faster-whisper/cpp size tag, is_distil)
-MODEL_OPTIONS = [
-    ("Distil-Large-v3  ★ FAST+ACCURATE", "distil-whisper/distil-large-v3",   "distil-large-v3", True),
-    ("Distil-Medium.en (English only)",   "distil-whisper/distil-medium.en",  "distil-medium.en",True),
-    ("Whisper Tiny     (ultrafast)",       "openai/whisper-tiny",              "tiny",            False),
-    ("Whisper Base     (very fast)",       "openai/whisper-base",              "base",            False),
-    ("Whisper Small    (fast)",            "openai/whisper-small",             "small",           False),
-    ("Whisper Medium   (balanced)",        "openai/whisper-medium",            "medium",          False),
-    ("Whisper Large-v3 (best accuracy)",   "openai/whisper-large-v3",         "large-v3",        False),
+SR16 = 16000  # Whisper expects 16 kHz
+
+# (display, hf_model_id, faster_whisper_size)
+MODELS = [
+    ("tiny   — fastest, low accuracy",      "openai/whisper-tiny",     "tiny"),
+    ("base   — very fast",                  "openai/whisper-base",     "base"),
+    ("small  — fast, decent accuracy",      "openai/whisper-small",    "small"),
+    ("medium — balanced",                   "openai/whisper-medium",   "medium"),
+    ("large-v3 — best accuracy",            "openai/whisper-large-v3", "large-v3"),
 ]
 
-LANG_OPTIONS = [
+# (display, iso_code, hf_full_name)
+# iso_code  → used by faster-whisper
+# hf_name   → used by HuggingFace generate()
+LANGUAGES = [
     ("English",  "en", "english"),
     ("Hindi",    "hi", "hindi"),
     ("Gujarati", "gu", "gujarati"),
     ("Marathi",  "mr", "marathi"),
 ]
 
-PREDICTION_MODES = [
+PRED_MODES = [
     ("Full Transcript", "full"),
     ("First Word",      "word"),
     ("First Character",  "char"),
 ]
 
-# Build engine list from available backends
-ENGINE_OPTIONS = []
-if HAS_WHISPERCPP:
-    ENGINE_OPTIONS.append(("whisper.cpp  (C++, fastest)",    "whispercpp"))
-if HAS_FASTER_WHISPER:
-    ENGINE_OPTIONS.append(("faster-whisper (CTranslate2)",   "faster_whisper"))
-if HAS_HF:
-    ENGINE_OPTIONS.append(("HuggingFace pipeline",           "hf_pipeline"))
-    ENGINE_OPTIONS.append(("HuggingFace batched",            "hf_batched"))
+# Available engines
+ENGINES = []
+if _HAS_FASTER_WHISPER:
+    ENGINES.append(("faster-whisper (recommended)", "faster_whisper"))
+if _HAS_HF:
+    ENGINES.append(("HuggingFace transformers",     "huggingface"))
 
-TARGET_SR = 16000
 CPU_THREADS = max(1, min(os.cpu_count() or 4, 8))
-VERBOSE = True
 
-# ── Unicode ──────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TEXT & AUDIO UTILITIES
+# ══════════════════════════════════════════════════════════════════════════
+
+# Unicode: Devanagari + Devanagari Extended + Vedic + Gujarati
 _INDIC = r"\u0900-\u097F\uA8E0-\uA8FF\u1CD0-\u1CFF\u0A80-\u0AFF"
-_RE_KEEP   = re.compile(rf"[^A-Za-z0-9\s{_INDIC}.,!?'\-]", re.UNICODE)
+_RE_CLEAN  = re.compile(rf"[^A-Za-z0-9\s{_INDIC}.,!?'\-]", re.UNICODE)
 _RE_SPACES = re.compile(r"\s+")
 _RE_NORM   = re.compile(rf"[^a-z0-9{_INDIC}]", re.UNICODE)
 _RE_ALPHA  = re.compile(rf"[A-Za-z{_INDIC}]", re.UNICODE)
 
 
-def log(msg, force=False):
-    if VERBOSE or force:
-        print(f"[LOG] {msg}", flush=True)
-
-def warn(msg):
-    print(f"[WARN] {msg}", flush=True)
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  UTILITIES
-# ══════════════════════════════════════════════════════════════════════════
+def clean_text(text, mode="full"):
+    """Clean transcription output."""
+    if not text:
+        return ""
+    text = _RE_CLEAN.sub("", str(text).strip())
+    text = _RE_SPACES.sub(" ", text).strip()
+    if not text:
+        return ""
+    if mode == "word":
+        return text.split()[0] if text.split() else ""
+    if mode == "char":
+        m = _RE_ALPHA.search(text)
+        return m.group(0) if m else ""
+    return text
 
-def load_audio_fast(path):
-    if HAS_SOUNDFILE:
+
+def norm_text(s):
+    """Normalise for comparison: lowercase, remove non-alphanumeric."""
+    return _RE_NORM.sub("", str(s).strip().lower())
+
+
+def edit_distance(a, b):
+    """Levenshtein distance."""
+    na, nb = len(a), len(b)
+    if na == 0: return nb
+    if nb == 0: return na
+    dp = list(range(nb + 1))
+    for i in range(1, na + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, nb + 1):
+            tmp = dp[j]
+            dp[j] = prev if a[i-1] == b[j-1] else 1 + min(prev, dp[j], dp[j-1])
+            prev = tmp
+    return dp[nb]
+
+
+def accuracy(pred, gt):
+    """Character-level accuracy: 1 - CER, clamped [0,1]."""
+    p, g = norm_text(pred), norm_text(gt)
+    if not g and not p: return 1.0
+    if not g: return 0.0
+    return max(0.0, 1.0 - edit_distance(p, g) / len(g))
+
+
+def load_audio(path):
+    """Load audio file as mono float32 + its sample rate."""
+    if _HAS_SF:
         try:
             data, sr = sf.read(path, dtype="float32", always_2d=True)
-            return (data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]), sr
+            y = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
+            return y.astype(np.float32), sr
         except Exception:
             pass
+    # Fallback to librosa
     import librosa
-    return librosa.load(path, sr=None, mono=True)
+    y, sr = librosa.load(path, sr=None, mono=True)
+    return y.astype(np.float32), sr
 
 
-def resample_fast(y, orig_sr, target_sr):
+def resample(y, orig_sr, target_sr):
+    """Resample audio. scipy polyphase > librosa."""
     if orig_sr == target_sr:
         return y
-    if HAS_SCIPY:
-        g = gcd(orig_sr, target_sr)
+    if _HAS_SCIPY:
+        g = gcd(int(orig_sr), int(target_sr))
         return resample_poly(y, target_sr // g, orig_sr // g).astype(np.float32)
     import librosa
-    return librosa.resample(y, orig_sr=orig_sr, target_sr=target_sr)
+    return librosa.resample(y, orig_sr=orig_sr, target_sr=target_sr).astype(np.float32)
 
 
-def time_to_sec(x):
+def parse_time(x):
+    """Parse timestamp string → seconds."""
     if pd.isna(x):
         return None
     x = str(x).strip()
@@ -200,66 +227,30 @@ def time_to_sec(x):
         return None
 
 
-def norm_text(s):
-    return _RE_NORM.sub("", str(s).strip().lower())
-
-
-def edit_distance(s1, s2):
-    n, m = len(s1), len(s2)
-    if n == 0: return m
-    if m == 0: return n
-    dp = list(range(m + 1))
-    for i in range(1, n + 1):
-        prev, dp[0] = dp[0], i
-        for j in range(1, m + 1):
-            temp = dp[j]
-            dp[j] = prev if s1[i-1] == s2[j-1] else 1 + min(prev, dp[j], dp[j-1])
-            prev = temp
-    return dp[m]
-
-
-def compute_accuracy(pred, gt):
-    p, g = norm_text(pred), norm_text(gt)
-    if not g and not p: return 1.0
-    if not g: return 0.0
-    return max(0.0, 1.0 - edit_distance(p, g) / len(g))
-
-
-def clean_prediction(text, mode="full"):
-    if not text: return ""
-    text = _RE_KEEP.sub("", str(text).strip())
-    text = _RE_SPACES.sub(" ", text).strip()
-    if not text: return ""
-    if mode == "full": return text
-    if mode == "word":
-        parts = text.split()
-        return parts[0] if parts else ""
-    if mode == "char":
-        m = _RE_ALPHA.search(text)
-        return m.group(0) if m else ""
-    return text
-
-
 @lru_cache(maxsize=8)
-def pick_font(lang_code):
-    specs = {
-        "hi": (["/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
-                "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf",
-                "/Library/Fonts/NotoSansDevanagari-Regular.ttf",
-                os.path.expanduser("~/Library/Fonts/NotoSansDevanagari-Regular.ttf")],
-               ["Noto Sans Devanagari","Lohit Devanagari","Kohinoor Devanagari","Mangal","Arial Unicode MS"]),
-        "gu": (["/usr/share/fonts/truetype/noto/NotoSansGujarati-Regular.ttf",
-                "/usr/share/fonts/truetype/lohit-gujarati/Lohit-Gujarati.ttf",
-                "/Library/Fonts/NotoSansGujarati-Regular.ttf",
-                os.path.expanduser("~/Library/Fonts/NotoSansGujarati-Regular.ttf")],
-               ["Noto Sans Gujarati","Lohit Gujarati","Shruti","Arial Unicode MS"]),
-        "en": ([], ["Arial","Helvetica","DejaVu Sans"]),
+def get_font(lang_code):
+    """Find a font that can render the given language."""
+    mapping = {
+        "hi": (["NotoSansDevanagari-Regular.ttf", "Lohit-Devanagari.ttf"],
+               ["Noto Sans Devanagari", "Lohit Devanagari", "Mangal", "Arial Unicode MS"]),
+        "gu": (["NotoSansGujarati-Regular.ttf", "Lohit-Gujarati.ttf"],
+               ["Noto Sans Gujarati", "Lohit Gujarati", "Shruti", "Arial Unicode MS"]),
+        "en": ([], ["Arial", "Helvetica", "DejaVu Sans"]),
     }
     lc = "hi" if lang_code == "mr" else lang_code
-    files, families = specs.get(lc, specs["en"])
-    for p in files:
-        if os.path.exists(p):
-            return fm.FontProperties(fname=p)
+    filenames, families = mapping.get(lc, mapping["en"])
+
+    search_dirs = [
+        "/usr/share/fonts", "/Library/Fonts",
+        os.path.expanduser("~/Library/Fonts"),
+        os.path.expanduser("~/.local/share/fonts"),
+    ]
+    for d in search_dirs:
+        for root, _, files in os.walk(d):
+            for fn in filenames:
+                if fn in files:
+                    return fm.FontProperties(fname=os.path.join(root, fn))
+
     installed = {f.name for f in fm.fontManager.ttflist}
     for fam in families:
         if fam in installed:
@@ -267,343 +258,232 @@ def pick_font(lang_code):
     return None
 
 
-# ── Vectorised VAD ───────────────────────────────────────────────────────
-def vad_segment_audio(y, sr, min_silence_ms=300, silence_thresh_db=-40,
-                      min_segment_ms=200, max_segment_ms=10000):
-    frame_len = int(sr * 0.025)
-    hop_len   = int(sr * 0.010)
-    n_frames  = 1 + (len(y) - frame_len) // hop_len
+# ══════════════════════════════════════════════════════════════════════════
+#  VAD SEGMENTATION (fully vectorised)
+# ══════════════════════════════════════════════════════════════════════════
+
+def vad_segment(y, sr, silence_ms=300, thresh_db=-40, min_ms=200, max_ms=10000):
+    """Energy-based VAD. Returns list of {start, end} dicts (in seconds)."""
+    frame_len = int(sr * 0.025)  # 25 ms
+    hop = int(sr * 0.010)        # 10 ms
+    n_frames = 1 + (len(y) - frame_len) // hop
     if n_frames <= 0:
         return []
 
-    indices = np.arange(frame_len)[None, :] + np.arange(n_frames)[:, None] * hop_len
-    np.clip(indices, 0, len(y) - 1, out=indices)
-    rms = np.sqrt(np.mean(y[indices] ** 2, axis=1) + 1e-12)
+    # Compute RMS per frame
+    idx = np.arange(frame_len)[None, :] + np.arange(n_frames)[:, None] * hop
+    np.clip(idx, 0, len(y) - 1, out=idx)
+    rms = np.sqrt(np.mean(y[idx] ** 2, axis=1) + 1e-12)
     rms_db = 20.0 * np.log10(rms / (rms.max() + 1e-12) + 1e-12)
-    is_voice = rms_db > silence_thresh_db
 
-    ms2f = lambda ms: max(1, int((ms / 1000) * sr / hop_len))
-    min_sil_f, min_seg_f, max_seg_f = ms2f(min_silence_ms), ms2f(min_segment_ms), ms2f(max_segment_ms)
+    voiced = rms_db > thresh_db
 
-    padded = np.concatenate([[False], is_voice, [False]])
-    diffs  = np.diff(padded.astype(np.int8))
-    starts = np.where(diffs == 1)[0]
-    ends   = np.where(diffs == -1)[0]
+    # Find voiced runs
+    pad = np.concatenate([[False], voiced, [False]])
+    diff = np.diff(pad.astype(np.int8))
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
 
-    merged_s, merged_e = [], []
+    # Merge short silences
+    sil_f = max(1, int(silence_ms / 1000 * sr / hop))
+    min_f = max(1, int(min_ms / 1000 * sr / hop))
+    max_f = max(1, int(max_ms / 1000 * sr / hop))
+
+    merged = []
     i = 0
     while i < len(starts):
         s, e = starts[i], ends[i]
-        while i + 1 < len(starts) and (starts[i+1] - e) < min_sil_f:
-            i += 1; e = ends[i]
-        merged_s.append(s); merged_e.append(e); i += 1
+        while i + 1 < len(starts) and (starts[i+1] - e) < sil_f:
+            i += 1
+            e = ends[i]
+        merged.append((s, e))
+        i += 1
 
+    # Split long segments, filter short, convert to seconds
     result = []
-    for s, e in zip(merged_s, merged_e):
-        if (e - s) < min_seg_f: continue
-        for cs in range(s, e, max_seg_f):
-            ce = min(cs + max_seg_f, e)
-            if (ce - cs) >= min_seg_f:
-                result.append({"start": round(cs * hop_len / sr, 4),
-                               "end":   round(min(ce * hop_len / sr, len(y) / sr), 4)})
-    log(f"VAD: {len(result)} segments")
+    for s, e in merged:
+        if (e - s) < min_f:
+            continue
+        for cs in range(s, e, max_f):
+            ce = min(cs + max_f, e)
+            if (ce - cs) >= min_f:
+                result.append({
+                    "start": round(cs * hop / sr, 4),
+                    "end":   round(min(ce * hop / sr, len(y) / sr), 4),
+                })
     return result
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  BACKENDS
+#  TRANSCRIPTION ENGINE
 # ══════════════════════════════════════════════════════════════════════════
 
-class WhisperCppBackend:
-    """
-    whisper.cpp via pywhispercpp — fastest possible inference.
-    Pure C++, int8/int16 quantised, multi-threaded.
-    ~25-40× faster than HuggingFace on CPU.
-    """
-    NAME = "whisper.cpp"
+class TranscriptionEngine:
+    """Unified interface wrapping faster-whisper or HuggingFace."""
 
-    def __init__(self, model_size, n_threads=None):
+    def __init__(self):
+        self.engine_type = None   # "faster_whisper" or "huggingface"
+        self.model = None
+        self.processor = None     # HF only
+        self.device = None        # HF only
+        self._loaded_key = None   # (engine_type, model_size)
+
+    @property
+    def is_loaded(self):
+        return self.model is not None
+
+    def load(self, engine_type, hf_model_id, fw_size, progress_fn=None):
+        """
+        Load (or reuse) a model.
+        Returns (success: bool, message: str, elapsed: float)
+        """
+        cache_key = (engine_type, fw_size)
+        if self._loaded_key == cache_key and self.model is not None:
+            return True, f"Already loaded: {fw_size}", 0.0
+
         t0 = time.time()
-        self.n_threads = n_threads or CPU_THREADS
-        log(f"[whisper.cpp] Loading '{model_size}' with {self.n_threads} threads")
+        self.model = None
+        self.processor = None
+        self.engine_type = engine_type
 
-        # pywhispercpp auto-downloads models
-        self.model = WhisperCppModel(model_size, n_threads=self.n_threads)
-        log(f"[whisper.cpp] Loaded in {time.time()-t0:.1f}s")
+        try:
+            if engine_type == "faster_whisper":
+                self._load_faster_whisper(fw_size)
+            elif engine_type == "huggingface":
+                self._load_huggingface(hf_model_id)
+            else:
+                return False, f"Unknown engine: {engine_type}", 0.0
 
-    def transcribe_one(self, audio, sr, lang_code, mode):
-        if audio is None or len(audio) == 0:
-            return ""
-        if len(audio) < int(0.1 * sr):
-            audio = np.pad(audio, (0, int(0.1 * sr) - len(audio)))
+            self._loaded_key = cache_key
+            elapsed = time.time() - t0
+            return True, f"Loaded {fw_size} ({engine_type}) in {elapsed:.1f}s", elapsed
 
-        segments = self.model.transcribe(audio, language=lang_code)
-        text = " ".join(s.text.strip() for s in segments)
-        return clean_prediction(text, mode)
+        except Exception as e:
+            traceback.print_exc()
+            self.model = None
+            return False, str(e), time.time() - t0
 
-    def transcribe_batch(self, chunks, sr, lang_code, lang_name, mode, progress_cb=None):
-        """Parallel transcription using ThreadPoolExecutor."""
-        total = len(chunks)
-        results = [""] * total
-        done = [0]
-
-        # whisper.cpp is thread-safe for separate model calls
-        # But single model isn't thread-safe, so sequential with fast C++
-        for i, chunk in enumerate(chunks):
-            results[i] = self.transcribe_one(chunk, sr, lang_code, mode)
-            done[0] += 1
-            if progress_cb:
-                progress_cb(done[0], total)
-
-        return results
-
-
-class FasterWhisperBackend:
-    """CTranslate2 backend — 4-8× faster than HF, supports int8 quantisation."""
-    NAME = "faster-whisper"
-
-    def __init__(self, model_size, device="cpu"):
-        t0 = time.time()
-        dev = device.split(":")[0]
-        compute = "float16" if dev == "cuda" else "int8"
-        log(f"[faster-whisper] Loading '{model_size}' on {dev} ({compute})")
-
-        self.model = FasterWhisperModel(
-            model_size,
-            device=dev,
-            compute_type=compute,
+    def _load_faster_whisper(self, size):
+        log(f"Loading faster-whisper model: {size}")
+        self.model = _FWModel(
+            size,
+            device="cuda" if (_HAS_HF and torch.cuda.is_available()) else "cpu",
+            compute_type="float16" if (_HAS_HF and torch.cuda.is_available()) else "int8",
             cpu_threads=CPU_THREADS,
-            num_workers=min(4, CPU_THREADS),
         )
-        log(f"[faster-whisper] Loaded in {time.time()-t0:.1f}s")
+        log(f"faster-whisper model loaded: {size}")
 
-    def transcribe_one(self, audio, sr, lang_code, mode):
-        if audio is None or len(audio) == 0:
-            return ""
-        if len(audio) < int(0.1 * sr):
-            audio = np.pad(audio, (0, int(0.1 * sr) - len(audio)))
+    def _load_huggingface(self, model_id):
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
-        segments, _ = self.model.transcribe(
-            audio, language=lang_code, task="transcribe",
-            beam_size=1, vad_filter=False, without_timestamps=True,
-        )
-        text = " ".join(s.text.strip() for s in segments)
-        return clean_prediction(text, mode)
-
-    def transcribe_batch(self, chunks, sr, lang_code, lang_name, mode, progress_cb=None):
-        total = len(chunks)
-        results = [""] * total
-        for i, chunk in enumerate(chunks):
-            results[i] = self.transcribe_one(chunk, sr, lang_code, mode)
-            if progress_cb:
-                progress_cb(i + 1, total)
-        return results
-
-
-class HFPipelineBackend:
-    """
-    HuggingFace pipeline API — simplest, supports distil-whisper.
-    Uses chunked processing and automatic batching internally.
-    """
-    NAME = "hf-pipeline"
-
-    def __init__(self, model_id, device="cpu", batch_size=16):
-        t0 = time.time()
-        self.batch_size = batch_size
-
-        if device != "cpu" and "cuda" in device:
-            dev = device
-            dt = torch.float16
-        else:
-            dev = "cpu"
-            dt = torch.float32
-
-        log(f"[HF-pipeline] Loading '{model_id}' on {dev}")
-
-        self.pipe = pipeline(
-            "automatic-speech-recognition",
-            model=model_id,
-            torch_dtype=dt,
-            device=dev,
-        )
-        log(f"[HF-pipeline] Loaded in {time.time()-t0:.1f}s")
-
-    def transcribe_batch(self, chunks, sr, lang_code, lang_name, mode, progress_cb=None):
-        total = len(chunks)
-        results = [""] * total
-
-        # Pad short chunks
-        min_len = int(0.1 * sr)
-        padded = []
-        valid_indices = []
-        for i, c in enumerate(chunks):
-            if c is None or len(c) == 0:
-                continue
-            if len(c) < min_len:
-                c = np.pad(c, (0, min_len - len(c)))
-            padded.append({"raw": c, "sampling_rate": sr})
-            valid_indices.append(i)
-
-        if not padded:
-            if progress_cb:
-                progress_cb(total, total)
-            return results
-
-        gen_kwargs = {"task": "transcribe", "language": lang_name}
-
-        done = 0
-        for out in self.pipe(
-            padded,
-            batch_size=self.batch_size,
-            generate_kwargs=gen_kwargs,
-            return_timestamps=False,
-        ):
-            idx = valid_indices[done]
-            text = out.get("text", "") if isinstance(out, dict) else ""
-            results[idx] = clean_prediction(text, mode)
-            done += 1
-            if progress_cb:
-                progress_cb(done, total)
-
-        # Fill remaining progress
-        if progress_cb and done < total:
-            progress_cb(total, total)
-
-        return results
-
-
-class HFBatchedBackend:
-    """HuggingFace manual batching with torch.compile — best GPU throughput."""
-    NAME = "hf-batched"
-
-    def __init__(self, model_id, device="cpu", batch_size=16):
-        t0 = time.time()
-        self.batch_size = batch_size
-
-        if "cuda" in device:
-            self.device = device
-            dtype = torch.float16
-        else:
-            self.device = "cpu"
-            try:
-                torch.zeros(1, dtype=torch.bfloat16)
-                dtype = torch.bfloat16
-            except Exception:
-                dtype = torch.float32
-
-        log(f"[HF-batched] Loading '{model_id}' on {self.device} (dtype={dtype})")
+        log(f"Loading HuggingFace model: {model_id} on {device} ({dtype})")
 
         self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            model_id, torch_dtype=dtype,
-            low_cpu_mem_usage=True, use_safetensors=True,
-        ).to(self.device)
-
-        if hasattr(torch, "compile") and "cuda" in self.device:
-            try:
-                self.model = torch.compile(self.model, mode="reduce-overhead")
-                log("[HF-batched] torch.compile enabled")
-            except Exception:
-                pass
+            model_id,
+            torch_dtype=dtype,       # ← correct param name (NOT "dtype")
+            low_cpu_mem_usage=True,
+            use_safetensors=True,
+        ).to(device)
 
         self.processor = AutoProcessor.from_pretrained(model_id)
-        log(f"[HF-batched] Loaded in {time.time()-t0:.1f}s")
+        self.device = device
+        log(f"HuggingFace model loaded: {model_id}")
 
-    def transcribe_batch(self, chunks, sr, lang_code, lang_name, mode, progress_cb=None):
-        total = len(chunks)
-        results = [""] * total
-        done = 0
-        min_len = int(0.1 * sr)
+    def transcribe(self, audio_16k, lang_iso, lang_name, mode="full"):
+        """
+        Transcribe a single audio segment.
 
-        for bs in range(0, total, self.batch_size):
-            be = min(bs + self.batch_size, total)
-            batch, indices = [], []
+        Args:
+            audio_16k: float32 numpy array at 16kHz
+            lang_iso:  ISO 639-1 code ("gu", "hi", "mr", "en")
+            lang_name: full name ("gujarati", "hindi", "marathi", "english")
+            mode:      "full", "word", or "char"
 
-            for i in range(bs, be):
-                c = chunks[i]
-                if c is None or len(c) == 0:
-                    continue
-                if len(c) < min_len:
-                    c = np.pad(c, (0, min_len - len(c)))
-                batch.append(c)
-                indices.append(i)
+        Returns:
+            str: cleaned transcription
+        """
+        if self.model is None:
+            return ""
+        if audio_16k is None or len(audio_16k) == 0:
+            return ""
 
-            if batch:
-                inputs = self.processor(
-                    batch, sampling_rate=sr, return_tensors="pt",
-                    padding=True, return_attention_mask=True,
-                )
-                feat = inputs.input_features.to(self.device)
-                mask = getattr(inputs, "attention_mask", None)
-                if mask is not None:
-                    mask = mask.to(self.device)
+        # Pad very short segments (< 0.1s) to avoid errors
+        min_samples = int(0.1 * SR16)
+        if len(audio_16k) < min_samples:
+            audio_16k = np.pad(audio_16k, (0, min_samples - len(audio_16k)))
 
-                gk = {"input_features": feat, "task": "transcribe",
-                      "language": lang_name, "return_timestamps": False}
-                if mask is not None:
-                    gk["attention_mask"] = mask
+        # Ensure float32
+        audio_16k = audio_16k.astype(np.float32)
 
-                with torch.inference_mode():
-                    ids = self.model.generate(**gk)
+        if self.engine_type == "faster_whisper":
+            return self._transcribe_fw(audio_16k, lang_iso, mode)
+        else:
+            return self._transcribe_hf(audio_16k, lang_name, mode)
 
-                texts = self.processor.batch_decode(ids, skip_special_tokens=True)
-                for idx, text in zip(indices, texts):
-                    results[idx] = clean_prediction(text, mode)
+    def _transcribe_fw(self, audio, lang_iso, mode):
+        """faster-whisper transcription."""
+        # transcribe() returns (generator, info) — MUST consume the generator!
+        segments_generator, info = self.model.transcribe(
+            audio,
+            language=lang_iso,     # ISO code: "gu", "hi", "mr", "en"
+            task="transcribe",
+            beam_size=1,           # greedy = fastest
+            best_of=1,
+            vad_filter=False,      # we do our own VAD
+            without_timestamps=True,
+            condition_on_previous_text=False,
+        )
 
-            done += (be - bs)
-            if progress_cb:
-                progress_cb(done, total)
+        # CRITICAL: consume the generator by converting to list
+        segments_list = list(segments_generator)
 
-        return results
+        # Join all segment texts
+        text = " ".join(seg.text.strip() for seg in segments_list if seg.text.strip())
+        return clean_text(text, mode)
+
+    def _transcribe_hf(self, audio, lang_name, mode):
+        """HuggingFace transcription."""
+        inputs = self.processor(
+            audio,
+            sampling_rate=SR16,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+
+        features = inputs.input_features.to(self.device)
+        attn_mask = getattr(inputs, "attention_mask", None)
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(self.device)
+
+        gen_kwargs = {
+            "input_features": features,
+            "task": "transcribe",
+            "language": lang_name,  # full name: "gujarati", "hindi", etc.
+            "return_timestamps": False,
+        }
+        if attn_mask is not None:
+            gen_kwargs["attention_mask"] = attn_mask
+
+        with torch.inference_mode():
+            ids = self.model.generate(**gen_kwargs)
+
+        text = self.processor.batch_decode(ids, skip_special_tokens=True)[0]
+        return clean_text(text, mode)
+
+
+# Global engine instance (persists across model switches)
+ENGINE = TranscriptionEngine()
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  MODEL CACHE — avoids reloading the same model
+#  BACKGROUND THREADS
 # ══════════════════════════════════════════════════════════════════════════
 
-_model_cache = {}  # key: (engine, model_size_or_id) → backend instance
-
-
-def get_or_load_backend(engine, model_id, model_size, batch_size):
-    """Return cached backend or create a new one. ~0s if already loaded."""
-    device = "cpu"
-    if HAS_HF:
-        import torch as _t
-        if _t.cuda.is_available():
-            device = "cuda:0"
-
-    cache_key = (engine, model_size if engine in ("whispercpp", "faster_whisper") else model_id)
-
-    if cache_key in _model_cache:
-        log(f"[CACHE HIT] Reusing {engine}/{model_size}")
-        return _model_cache[cache_key], device
-
-    t0 = time.time()
-
-    if engine == "whispercpp":
-        backend = WhisperCppBackend(model_size)
-    elif engine == "faster_whisper":
-        backend = FasterWhisperBackend(model_size, device)
-    elif engine == "hf_pipeline":
-        backend = HFPipelineBackend(model_id, device, batch_size)
-    elif engine == "hf_batched":
-        backend = HFBatchedBackend(model_id, device, batch_size)
-    else:
-        raise ValueError(f"Unknown engine: {engine}")
-
-    _model_cache[cache_key] = backend
-    elapsed = time.time() - t0
-    log(f"[CACHE MISS] Loaded {engine}/{model_size} in {elapsed:.1f}s")
-    return backend, device
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  THREADS
-# ══════════════════════════════════════════════════════════════════════════
-
-class AudioLoaderThread(QThread):
-    """Load + resample audio in background — UI stays responsive."""
-    finished_ok = pyqtSignal(np.ndarray, int, np.ndarray, str)  # y, sr, y16, path
-    failed = pyqtSignal(str)
+class AudioLoadThread(QThread):
+    """Load + resample audio without freezing UI."""
+    done = pyqtSignal(np.ndarray, int, np.ndarray, str)
+    error = pyqtSignal(str)
 
     def __init__(self, path):
         super().__init__()
@@ -612,55 +492,47 @@ class AudioLoaderThread(QThread):
     def run(self):
         try:
             t0 = time.time()
-            y, sr = load_audio_fast(self.path)
-            y16 = resample_fast(y, sr, TARGET_SR)
-            log(f"Audio loaded+resampled in {time.time()-t0:.2f}s "
-                f"({len(y)/sr:.1f}s, sr={sr})")
-            self.finished_ok.emit(y, sr, y16, self.path)
+            y, sr = load_audio(self.path)
+            y16 = resample(y, sr, SR16)
+            log(f"Audio loaded: {len(y)/sr:.1f}s, sr={sr} → 16kHz in {time.time()-t0:.2f}s")
+            self.done.emit(y, sr, y16, self.path)
         except Exception as e:
             traceback.print_exc()
-            self.failed.emit(str(e))
+            self.error.emit(str(e))
 
 
-class ModelLoaderThread(QThread):
-    finished_ok = pyqtSignal(object, str, str, float)  # backend, device, info, elapsed
-    failed = pyqtSignal(str)
+class ModelLoadThread(QThread):
+    """Load model without freezing UI."""
+    done = pyqtSignal(bool, str, float)  # success, message, elapsed
+    error = pyqtSignal(str)
 
-    def __init__(self, engine, model_id, model_size, batch_size):
+    def __init__(self, engine_type, hf_id, fw_size):
         super().__init__()
-        self.engine = engine
-        self.model_id = model_id
-        self.model_size = model_size
-        self.batch_size = batch_size
+        self.engine_type = engine_type
+        self.hf_id = hf_id
+        self.fw_size = fw_size
 
     def run(self):
         try:
-            t0 = time.time()
-            backend, device = get_or_load_backend(
-                self.engine, self.model_id, self.model_size, self.batch_size
-            )
-            elapsed = time.time() - t0
-            info = f"{backend.NAME} ({self.model_size}) on {device}"
-            self.finished_ok.emit(backend, device, info, elapsed)
+            ok, msg, elapsed = ENGINE.load(self.engine_type, self.hf_id, self.fw_size)
+            self.done.emit(ok, msg, elapsed)
         except Exception as e:
             traceback.print_exc()
-            self.failed.emit(str(e))
+            self.error.emit(str(e))
 
 
-class InferenceThread(QThread):
-    """Runs transcription and emits streaming per-segment results."""
-    segment_done = pyqtSignal(int, dict)   # index, result dict (for streaming)
-    progress = pyqtSignal(int, int, int)   # done, total, pct
-    finished_ok = pyqtSignal(list, float)  # all results, mean_acc
-    failed = pyqtSignal(str)
+class PredictionThread(QThread):
+    """Run transcription on all segments."""
+    segment_result = pyqtSignal(int, str, float)  # index, prediction, accuracy
+    progress = pyqtSignal(int, int)                # done, total
+    done = pyqtSignal(list, float, float)          # results, mean_acc, elapsed
+    error = pyqtSignal(str)
 
-    def __init__(self, backend, y16, sr16, gt_rows, lang_code, lang_name, mode):
+    def __init__(self, y16, segments, lang_iso, lang_name, mode):
         super().__init__()
-        self.backend = backend
         self.y16 = y16
-        self.sr16 = sr16
-        self.gt_rows = gt_rows
-        self.lang_code = lang_code
+        self.segments = segments     # list of {label, start, end}
+        self.lang_iso = lang_iso
         self.lang_name = lang_name
         self.mode = mode
         self._stop = False
@@ -670,61 +542,61 @@ class InferenceThread(QThread):
 
     def run(self):
         try:
-            total = len(self.gt_rows)
-            if total == 0:
-                self.finished_ok.emit([], 0.0)
-                return
+            t0 = time.time()
+            total = len(self.segments)
+            results = []
 
-            # Pre-slice audio
-            chunks = []
-            for row in self.gt_rows:
-                s = max(0, int(row["start"] * self.sr16))
-                e = min(len(self.y16), int(row["end"] * self.sr16))
-                chunks.append(self.y16[s:e])
+            log(f"Starting prediction: {total} segments, "
+                f"lang={self.lang_iso}/{self.lang_name}, mode={self.mode}")
 
-            log(f"Inference: {total} segs, {self.lang_code}, engine={self.backend.NAME}")
-
-            results = [None] * total
-            result_count = [0]
-
-            def on_progress(done, tot):
+            for i, seg in enumerate(self.segments):
                 if self._stop:
-                    raise InterruptedError("Stopped")
-                pct = int(done / tot * 100)
-                self.progress.emit(done, tot, pct)
+                    log("Prediction stopped by user")
+                    break
 
-            predictions = self.backend.transcribe_batch(
-                chunks, self.sr16, self.lang_code, self.lang_name,
-                self.mode, on_progress,
-            )
+                # Extract audio chunk
+                s_samp = max(0, int(seg["start"] * SR16))
+                e_samp = min(len(self.y16), int(seg["end"] * SR16))
+                chunk = self.y16[s_samp:e_samp]
 
-            all_results = []
-            for i, (row, pred) in enumerate(zip(self.gt_rows, predictions)):
-                acc = compute_accuracy(pred, row["label"])
-                r = {
-                    "gt": row["label"], "pred": pred,
-                    "gt_start": row["start"], "gt_end": row["end"],
-                    "pred_start": row["start"], "pred_end": row["end"],
-                    "score": acc,
-                }
-                all_results.append(r)
-                self.segment_done.emit(i, r)
+                # Transcribe
+                pred = ENGINE.transcribe(
+                    chunk, self.lang_iso, self.lang_name, self.mode
+                )
+                acc = accuracy(pred, seg["label"])
 
-            mean_acc = np.mean([r["score"] for r in all_results]) if all_results else 0.0
-            self.finished_ok.emit(all_results, float(mean_acc))
+                results.append({
+                    "index": i,
+                    "gt": seg["label"],
+                    "pred": pred,
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "accuracy": acc,
+                })
 
-        except InterruptedError:
-            warn("Inference stopped by user")
-            partial = [r for r in (results if 'results' in dir() else []) if r is not None]
-            self.finished_ok.emit(partial, 0.0)
+                # Emit per-segment result for streaming UI update
+                self.segment_result.emit(i, pred, acc)
+                self.progress.emit(i + 1, total)
+
+                if (i + 1) % 5 == 0 or (i + 1) == total:
+                    log(f"  [{i+1}/{total}] GT='{seg['label']}' → PRED='{pred}' acc={acc:.3f}")
+
+            elapsed = time.time() - t0
+            mean_acc = np.mean([r["accuracy"] for r in results]) if results else 0.0
+
+            log(f"Prediction complete: {len(results)} segments in {elapsed:.1f}s, "
+                f"mean accuracy={mean_acc:.3f}")
+
+            self.done.emit(results, float(mean_acc), elapsed)
+
         except Exception as e:
             traceback.print_exc()
-            self.failed.emit(str(e))
+            self.error.emit(str(e))
 
 
-class SegmentationThread(QThread):
-    finished_ok = pyqtSignal(list)
-    failed = pyqtSignal(str)
+class VADThread(QThread):
+    done = pyqtSignal(list)
+    error = pyqtSignal(str)
 
     def __init__(self, y, sr, params):
         super().__init__()
@@ -732,591 +604,755 @@ class SegmentationThread(QThread):
 
     def run(self):
         try:
-            self.finished_ok.emit(vad_segment_audio(self.y, self.sr, **self.params))
+            segs = vad_segment(self.y, self.sr, **self.params)
+            self.done.emit(segs)
         except Exception as e:
             traceback.print_exc()
-            self.failed.emit(str(e))
+            self.error.emit(str(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  MAIN WINDOW
+#  MAIN APPLICATION
 # ══════════════════════════════════════════════════════════════════════════
 
-class AnnotationTool(QMainWindow):
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Indic Annotation Tool  [ULTRA-FAST]")
+        self.setWindowTitle("Indic Speech Annotation Tool")
         self.resize(1700, 1000)
 
-        self.audio_path = self.xlsx_path = None
-        self.y = self.y16 = self.wave_t = self.wave_y = None
+        # ── State ─────────────────────────────────────────────────────────
+        self.audio_path = None
+        self.y = None           # original sample rate
         self.sr = None
+        self.y16 = None         # 16 kHz for Whisper
+        self.wave_t = None      # downsampled time axis for plotting
+        self.wave_y = None      # downsampled amplitude for plotting
 
-        self.backend = None
-        self.device = None
-        self._loaded_model_key = None  # track what's loaded
+        self.segments = []      # list of {label, start, end}
+        self.results = []       # list of {index, gt, pred, start, end, accuracy}
+        self.selected_idx = None
 
-        self.gt_rows = []
-        self.results = []
-        self.selected_index = None
-
-        self.model_thread = self.infer_thread = self.seg_thread = None
-        self.audio_thread = None
+        # Active threads
+        self._audio_thread = None
+        self._model_thread = None
+        self._pred_thread = None
+        self._vad_thread = None
+        self._pred_start_time = None
 
         self._build_ui()
-        log("Application ready — auto-preloading default model...")
 
-        # ── Auto-preload model on launch (0ms UI delay) ──────────────────
-        QTimer.singleShot(100, self._auto_preload_model)
+        # Auto-load default model after UI is up
+        QTimer.singleShot(200, self._auto_load_model)
 
-    def _auto_preload_model(self):
-        """Start loading the default model immediately on app launch."""
-        if self.backend is not None:
-            return
-        self.load_model(auto=True)
+    # ══════════════════════════════════════════════════════════════════════
+    #  UI CONSTRUCTION
+    # ══════════════════════════════════════════════════════════════════════
 
-    # ── UI ────────────────────────────────────────────────────────────────
     def _build_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
-        L = QVBoxLayout(root); L.setSpacing(4); L.setContentsMargins(8,8,8,8)
+        main_layout = QVBoxLayout(root)
+        main_layout.setSpacing(4)
+        main_layout.setContentsMargins(8, 8, 8, 8)
 
-        # Row 1 — Config
-        r1 = QHBoxLayout()
-        self.lang_combo = QComboBox()
-        for lbl, c, w in LANG_OPTIONS:
-            self.lang_combo.addItem(lbl, (c, w))
+        # ── Row 1: Configuration ──────────────────────────────────────────
+        row1 = QHBoxLayout()
 
-        self.model_combo = QComboBox()
-        for lbl, mid, sz, is_d in MODEL_OPTIONS:
-            self.model_combo.addItem(lbl, (mid, sz, is_d))
-        self.model_combo.setCurrentIndex(0)  # Distil-large-v3 default
+        self.cb_lang = QComboBox()
+        for display, iso, name in LANGUAGES:
+            self.cb_lang.addItem(display, (iso, name))
 
-        self.engine_combo = QComboBox()
-        for lbl, val in ENGINE_OPTIONS:
-            self.engine_combo.addItem(lbl, val)
+        self.cb_model = QComboBox()
+        for display, hf_id, fw_size in MODELS:
+            self.cb_model.addItem(display, (hf_id, fw_size))
+        self.cb_model.setCurrentIndex(2)  # small as default
 
-        self.mode_combo = QComboBox()
-        for lbl, m in PREDICTION_MODES:
-            self.mode_combo.addItem(lbl, m)
+        self.cb_engine = QComboBox()
+        for display, key in ENGINES:
+            self.cb_engine.addItem(display, key)
 
-        self.batch_spin = QSpinBox()
-        self.batch_spin.setRange(1, 64); self.batch_spin.setValue(16)
-        self.batch_spin.setToolTip("Batch size (HF engines only)")
+        self.cb_mode = QComboBox()
+        for display, key in PRED_MODES:
+            self.cb_mode.addItem(display, key)
 
-        self.load_audio_btn = QPushButton("Load Audio")
-        self.load_audio_btn.clicked.connect(self.load_audio)
-        self.load_gt_btn = QPushButton("Load GT (.xlsx/.csv)")
-        self.load_gt_btn.clicked.connect(self.load_gt)
-        self.load_model_btn = QPushButton("Load Model")
-        self.load_model_btn.clicked.connect(self.load_model)
+        self.btn_load_audio = QPushButton("Load Audio")
+        self.btn_load_audio.clicked.connect(self.on_load_audio)
 
-        for w in [QLabel("Lang:"), self.lang_combo,
-                  QLabel("Model:"), self.model_combo,
-                  QLabel("Engine:"), self.engine_combo,
-                  QLabel("Batch:"), self.batch_spin,
-                  QLabel("Mode:"), self.mode_combo,
-                  self.load_audio_btn, self.load_gt_btn, self.load_model_btn]:
-            r1.addWidget(w)
-        r1.addStretch()
+        self.btn_load_gt = QPushButton("Load Ground Truth")
+        self.btn_load_gt.clicked.connect(self.on_load_gt)
 
-        # Row 2 — Actions
-        r2 = QHBoxLayout()
-        action_defs = [
-            ("▶ Run",        self.run_inference),
-            ("⏹ Stop",       self.stop_inference),
-            ("Auto-Segment", self.run_auto_segmentation),
-            ("♫ Play All",   self.play_audio),
-            ("♫ Play Seg",   self.play_selected_segment),
-            ("⏸ Stop Audio", self.stop_audio),
-            ("🔍+",          lambda: self.zoom(0.6)),
-            ("🔍−",          lambda: self.zoom(1.6)),
-            ("Reset View",   self.reset_plot_view),
-            ("Export CSV",   self.export_csv),
-        ]
-        self._btns = {}
-        for name, fn in action_defs:
-            b = QPushButton(name)
-            b.clicked.connect(fn)
-            r2.addWidget(b)
-            self._btns[name] = b
-        self._btns["⏹ Stop"].setEnabled(False)
-        r2.addStretch()
+        self.btn_load_model = QPushButton("Load Model")
+        self.btn_load_model.clicked.connect(self.on_load_model)
 
-        # Status bar
+        for w in [QLabel("Language:"), self.cb_lang,
+                  QLabel("Model:"), self.cb_model,
+                  QLabel("Engine:"), self.cb_engine,
+                  QLabel("Output:"), self.cb_mode,
+                  self.btn_load_audio, self.btn_load_gt, self.btn_load_model]:
+            row1.addWidget(w)
+        row1.addStretch()
+
+        # ── Row 2: Actions ────────────────────────────────────────────────
+        row2 = QHBoxLayout()
+
+        self.btn_run = QPushButton("▶ Run Prediction")
+        self.btn_run.clicked.connect(self.on_run_prediction)
+        self.btn_run.setStyleSheet("font-weight: bold; color: #16a34a;")
+
+        self.btn_stop = QPushButton("⏹ Stop")
+        self.btn_stop.clicked.connect(self.on_stop_prediction)
+        self.btn_stop.setEnabled(False)
+
+        self.btn_vad = QPushButton("Auto-Segment (VAD)")
+        self.btn_vad.clicked.connect(self.on_run_vad)
+
+        self.btn_play_all = QPushButton("♫ Play All")
+        self.btn_play_all.clicked.connect(lambda: self._play(self.y, self.sr))
+
+        self.btn_play_seg = QPushButton("♫ Play Segment")
+        self.btn_play_seg.clicked.connect(self.on_play_segment)
+
+        self.btn_stop_audio = QPushButton("⏸ Stop Audio")
+        self.btn_stop_audio.clicked.connect(sd.stop)
+
+        self.btn_zoom_in = QPushButton("🔍+")
+        self.btn_zoom_in.clicked.connect(lambda: self._zoom(0.6))
+
+        self.btn_zoom_out = QPushButton("🔍−")
+        self.btn_zoom_out.clicked.connect(lambda: self._zoom(1.6))
+
+        self.btn_reset = QPushButton("Reset View")
+        self.btn_reset.clicked.connect(self._reset_view)
+
+        self.btn_export = QPushButton("Export CSV")
+        self.btn_export.clicked.connect(self.on_export_csv)
+
+        for w in [self.btn_run, self.btn_stop, self.btn_vad,
+                  self.btn_play_all, self.btn_play_seg, self.btn_stop_audio,
+                  self.btn_zoom_in, self.btn_zoom_out, self.btn_reset,
+                  self.btn_export]:
+            row2.addWidget(w)
+        row2.addStretch()
+
+        # ── Status bar ────────────────────────────────────────────────────
         status_row = QHBoxLayout()
-        self.status_label = QLabel("Auto-loading model...")
-        self.status_label.setStyleSheet("padding:4px; font-size:13px;")
-        self.speed_label = QLabel("")
-        self.speed_label.setStyleSheet("padding:4px; font-size:12px; color:#6b7280;")
-        status_row.addWidget(self.status_label, 1)
-        status_row.addWidget(self.speed_label)
+        self.lbl_status = QLabel("Starting up...")
+        self.lbl_status.setStyleSheet("padding: 4px; font-size: 13px;")
+        self.lbl_speed = QLabel("")
+        self.lbl_speed.setStyleSheet("color: #6b7280; font-size: 12px;")
+        status_row.addWidget(self.lbl_status, 1)
+        status_row.addWidget(self.lbl_speed)
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100); self.progress_bar.setValue(0)
-        self.progress_bar.setFixedHeight(18)
-        self.progress_bar.setStyleSheet("""
-            QProgressBar { border:1px solid #ccc; border-radius:4px;
-                           background:#f3f4f6; text-align:center; font-size:11px; }
-            QProgressBar::chunk { background:#3b82f6; border-radius:4px; }
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFixedHeight(18)
+        self.progress.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #ccc; border-radius: 4px;
+                background: #f3f4f6; text-align: center; font-size: 11px;
+            }
+            QProgressBar::chunk { background: #3b82f6; border-radius: 4px; }
         """)
 
-        # Canvas
+        # ── Waveform plot ─────────────────────────────────────────────────
         self.fig, self.ax = plt.subplots(figsize=(14, 5))
         self.fig.set_tight_layout(True)
         self.canvas = FigureCanvas(self.fig)
         self.toolbar = NavigationToolbar(self.canvas, self)
-        self.canvas.mpl_connect("scroll_event", self.on_scroll)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll)
 
+        # ── Right panel ───────────────────────────────────────────────────
         # Segment list
         self.seg_list = QListWidget()
-        self.seg_list.itemClicked.connect(self.on_segment_clicked)
+        self.seg_list.itemClicked.connect(self.on_seg_clicked)
         self.seg_list.setStyleSheet("""
-            QListWidget { background:#fff; border:1px solid #d0d0d0;
-                          font-family: monospace; font-size:12px; }
-            QListWidget::item { padding:3px 6px; }
-            QListWidget::item:selected { background:#dbeafe; }
+            QListWidget {
+                background: #fff; border: 1px solid #d0d0d0;
+                font-family: "Consolas", "Courier New", monospace;
+                font-size: 12px;
+            }
+            QListWidget::item { padding: 3px 6px; }
+            QListWidget::item:selected { background: #dbeafe; }
         """)
 
         # VAD settings
-        vad_grp = QGroupBox("VAD Settings")
-        vl = QVBoxLayout(vad_grp)
-        self.vad_sil = QSpinBox();  self.vad_sil.setRange(50,2000);  self.vad_sil.setValue(300);  self.vad_sil.setSuffix(" ms")
-        self.vad_db  = QDoubleSpinBox(); self.vad_db.setRange(-80,0); self.vad_db.setValue(-40); self.vad_db.setSuffix(" dB")
-        self.vad_min = QSpinBox();  self.vad_min.setRange(50,5000);  self.vad_min.setValue(200);  self.vad_min.setSuffix(" ms")
-        self.vad_max = QSpinBox();  self.vad_max.setRange(1000,30000);self.vad_max.setValue(10000);self.vad_max.setSuffix(" ms")
-        for lbl, w in [("Silence gap:", self.vad_sil), ("Threshold:", self.vad_db),
-                       ("Min seg:", self.vad_min), ("Max seg:", self.vad_max)]:
-            h = QHBoxLayout(); h.addWidget(QLabel(lbl)); h.addWidget(w); vl.addLayout(h)
-        vl.addStretch()
+        vad_box = QGroupBox("VAD Parameters")
+        vad_lay = QVBoxLayout(vad_box)
 
-        # Speed tips
-        tips_grp = QGroupBox("Speed Tips")
-        tips_layout = QVBoxLayout(tips_grp)
-        tips_text = QLabel(
-            "★ <b>whisper.cpp</b> = fastest (C++, ~25× vs HF)<br>"
-            "★ <b>faster-whisper</b> = fast + accurate (int8)<br>"
-            "★ <b>distil-large-v3</b> = 6× faster than large-v3<br>"
-            "★ Model loads once → cached across runs<br>"
-            "★ CUDA GPU = 10-50× faster than CPU"
-        )
-        tips_text.setTextFormat(Qt.RichText)
-        tips_text.setWordWrap(True)
-        tips_text.setStyleSheet("font-size:11px; color:#374151;")
-        tips_layout.addWidget(tips_text)
-        tips_layout.addStretch()
+        self.sp_silence = QSpinBox()
+        self.sp_silence.setRange(50, 2000); self.sp_silence.setValue(300)
+        self.sp_silence.setSuffix(" ms")
 
+        self.sp_thresh = QDoubleSpinBox()
+        self.sp_thresh.setRange(-80, 0); self.sp_thresh.setValue(-40)
+        self.sp_thresh.setSuffix(" dB")
+
+        self.sp_min_seg = QSpinBox()
+        self.sp_min_seg.setRange(50, 5000); self.sp_min_seg.setValue(200)
+        self.sp_min_seg.setSuffix(" ms")
+
+        self.sp_max_seg = QSpinBox()
+        self.sp_max_seg.setRange(1000, 30000); self.sp_max_seg.setValue(10000)
+        self.sp_max_seg.setSuffix(" ms")
+
+        for label, widget in [
+            ("Min silence gap:", self.sp_silence),
+            ("Silence threshold:", self.sp_thresh),
+            ("Min segment:", self.sp_min_seg),
+            ("Max segment:", self.sp_max_seg),
+        ]:
+            h = QHBoxLayout()
+            h.addWidget(QLabel(label))
+            h.addWidget(widget)
+            vad_lay.addLayout(h)
+        vad_lay.addStretch()
+
+        # Tabs
         tabs = QTabWidget()
-        seg_tab = QWidget(); sl = QVBoxLayout(seg_tab)
+
+        seg_tab = QWidget()
+        seg_lay = QVBoxLayout(seg_tab)
         legend = QLabel(
-            '<span style="color:green;font-weight:600">GT</span> | '
-            '<span style="color:blue;font-weight:600">PRED</span> | '
-            '<span style="color:#16a34a">✓ ≥0.95</span> '
-            '<span style="color:#f59e0b">~ 0.5-0.95</span> '
-            '<span style="color:#dc2626">✗ &lt;0.5</span>'
+            '<span style="color:green; font-weight:bold;">■ GT</span>  '
+            '<span style="color:blue; font-weight:bold;">■ PRED</span>  '
+            '| Colour: '
+            '<span style="color:#16a34a;">✓≥95%</span>  '
+            '<span style="color:#ea580c;">~50-95%</span>  '
+            '<span style="color:#dc2626;">✗&lt;50%</span>'
         )
         legend.setTextFormat(Qt.RichText)
-        sl.addWidget(legend); sl.addWidget(self.seg_list)
-        tabs.addTab(seg_tab, "Segments")
-        tabs.addTab(vad_grp, "VAD")
-        tabs.addTab(tips_grp, "Speed")
+        seg_lay.addWidget(legend)
+        seg_lay.addWidget(self.seg_list)
 
-        left = QWidget(); ll = QVBoxLayout(left)
-        ll.addWidget(self.toolbar); ll.addWidget(self.canvas)
+        tabs.addTab(seg_tab, "Segments")
+        tabs.addTab(vad_box, "VAD Settings")
+
+        # Layout
+        left = QWidget()
+        left_lay = QVBoxLayout(left)
+        left_lay.addWidget(self.toolbar)
+        left_lay.addWidget(self.canvas)
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left); splitter.addWidget(tabs)
+        splitter.addWidget(left)
+        splitter.addWidget(tabs)
         splitter.setSizes([1250, 400])
 
-        L.addLayout(r1); L.addLayout(r2)
-        L.addLayout(status_row); L.addWidget(self.progress_bar)
-        L.addWidget(splitter)
+        main_layout.addLayout(row1)
+        main_layout.addLayout(row2)
+        main_layout.addLayout(status_row)
+        main_layout.addWidget(self.progress)
+        main_layout.addWidget(splitter)
 
-    # ── Helpers ───────────────────────────────────────────────────────────
-    def set_busy(self, busy, msg=""):
-        for name, b in self._btns.items():
-            b.setEnabled(not busy if name != "⏹ Stop" else busy)
-        for w in [self.load_audio_btn, self.load_gt_btn, self.load_model_btn,
-                  self.lang_combo, self.model_combo, self.engine_combo,
-                  self.mode_combo, self.batch_spin]:
-            w.setEnabled(not busy)
+    # ══════════════════════════════════════════════════════════════════════
+    #  UI HELPERS
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _set_busy(self, busy, msg=""):
+        """Disable/enable interactive controls."""
+        enabled = not busy
+        for w in [self.btn_load_audio, self.btn_load_gt, self.btn_load_model,
+                  self.btn_run, self.btn_vad, self.btn_export,
+                  self.cb_lang, self.cb_model, self.cb_engine, self.cb_mode]:
+            w.setEnabled(enabled)
+        self.btn_stop.setEnabled(busy)
         if msg:
-            self.status_label.setText(msg)
+            self.lbl_status.setText(msg)
 
-    def build_wave_cache(self):
+    def _build_wave_cache(self):
+        """Downsample waveform for fast plotting."""
         if self.y is None:
-            self.wave_t = self.wave_y = None; return
-        step = max(1, len(self.y) // 25000)
+            self.wave_t = self.wave_y = None
+            return
+        max_pts = 25000
+        step = max(1, len(self.y) // max_pts)
         self.wave_y = self.y[::step]
         self.wave_t = np.arange(len(self.wave_y)) * (step / self.sr)
 
-    # ── Load Audio (background thread) ────────────────────────────────────
-    def load_audio(self):
+    def _play(self, y, sr):
+        if y is not None and sr:
+            sd.stop()
+            sd.play(y, sr)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  LOAD AUDIO
+    # ══════════════════════════════════════════════════════════════════════
+
+    def on_load_audio(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Audio", "",
-            "Audio (*.wav *.mp3 *.flac *.ogg *.m4a *.webm)")
+            self, "Open Audio File", "",
+            "Audio (*.wav *.mp3 *.flac *.ogg *.m4a *.webm *.aac)")
         if not path:
             return
 
-        self.status_label.setText(f"Loading {os.path.basename(path)}...")
-        self.load_audio_btn.setEnabled(False)
+        self.lbl_status.setText(f"Loading {os.path.basename(path)}...")
+        self.btn_load_audio.setEnabled(False)
 
-        self.audio_thread = AudioLoaderThread(path)
-        self.audio_thread.finished_ok.connect(self._on_audio_ok)
-        self.audio_thread.failed.connect(self._on_audio_fail)
-        self.audio_thread.start()
+        self._audio_thread = AudioLoadThread(path)
+        self._audio_thread.done.connect(self._on_audio_loaded)
+        self._audio_thread.error.connect(self._on_audio_error)
+        self._audio_thread.start()
 
-    def _on_audio_ok(self, y, sr, y16, path):
+    def _on_audio_loaded(self, y, sr, y16, path):
         self.y, self.sr, self.y16, self.audio_path = y, sr, y16, path
-        self.results = []; self.selected_index = None
-        self.progress_bar.setValue(0)
-        self.build_wave_cache()
+        self.results = []
+        self.selected_idx = None
+        self.progress.setValue(0)
+        self._build_wave_cache()
+
         dur = len(y) / sr
-        self.status_label.setText(f"Audio: {os.path.basename(path)} | {dur:.1f}s | sr={sr}")
-        self.load_audio_btn.setEnabled(True)
-        self.refresh_list(); self.redraw()
+        self.lbl_status.setText(f"Audio: {os.path.basename(path)}  ({dur:.1f}s, sr={sr})")
+        self.btn_load_audio.setEnabled(True)
+        self._refresh_list()
+        self._redraw()
 
-    def _on_audio_fail(self, msg):
-        self.load_audio_btn.setEnabled(True)
-        QMessageBox.critical(self, "Error", msg)
+    def _on_audio_error(self, msg):
+        self.btn_load_audio.setEnabled(True)
+        QMessageBox.critical(self, "Audio Load Error", msg)
 
-    # ── Load GT ───────────────────────────────────────────────────────────
-    def load_gt(self):
+    # ══════════════════════════════════════════════════════════════════════
+    #  LOAD GROUND TRUTH
+    # ══════════════════════════════════════════════════════════════════════
+
+    def on_load_gt(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open GT", "", "Excel/CSV (*.xlsx *.csv)")
-        if not path: return
+            self, "Open Ground Truth", "",
+            "Spreadsheets (*.xlsx *.csv *.tsv)")
+        if not path:
+            return
+
         try:
-            df = (pd.read_csv(path, header=None) if path.endswith(".csv")
-                  else pd.read_excel(path, sheet_name=0, header=None, engine="openpyxl"))
-            rows, skip = [], 0
-            for _, r in df.iterrows():
-                lab = str(r.iloc[0]).strip()
-                s, e = time_to_sec(r.iloc[1]), time_to_sec(r.iloc[2])
-                if not lab or s is None or e is None or e <= s:
-                    skip += 1; continue
-                rows.append({"label": lab, "start": s, "end": e})
-            self.gt_rows = rows; self.xlsx_path = path
-            self.results = []; self.selected_index = None
-            self.status_label.setText(f"GT: {len(rows)} segments (skipped {skip})")
-            self.refresh_list(); self.redraw()
+            if path.endswith(".csv"):
+                df = pd.read_csv(path, header=None)
+            elif path.endswith(".tsv"):
+                df = pd.read_csv(path, header=None, sep="\t")
+            else:
+                df = pd.read_excel(path, sheet_name=0, header=None, engine="openpyxl")
+
+            segs = []
+            skipped = 0
+            for _, row in df.iterrows():
+                label = str(row.iloc[0]).strip()
+                start = parse_time(row.iloc[1])
+                end = parse_time(row.iloc[2])
+
+                if not label or start is None or end is None or end <= start:
+                    skipped += 1
+                    continue
+
+                segs.append({"label": label, "start": start, "end": end})
+
+            self.segments = segs
+            self.results = []
+            self.selected_idx = None
+            self.progress.setValue(0)
+
+            self.lbl_status.setText(
+                f"Ground truth: {len(segs)} segments loaded"
+                + (f" ({skipped} skipped)" if skipped else ""))
+            self._refresh_list()
+            self._redraw()
+
         except Exception as e:
             traceback.print_exc()
-            QMessageBox.critical(self, "Error", str(e))
+            QMessageBox.critical(self, "GT Load Error", str(e))
 
-    # ── Load Model (with cache) ──────────────────────────────────────────
-    def load_model(self, auto=False):
-        if self.model_thread and self.model_thread.isRunning():
+    # ══════════════════════════════════════════════════════════════════════
+    #  LOAD MODEL
+    # ══════════════════════════════════════════════════════════════════════
+
+    def on_load_model(self):
+        if self._model_thread and self._model_thread.isRunning():
             return
 
-        model_id, model_size, is_distil = self.model_combo.currentData()
-        engine = self.engine_combo.currentData()
-        bs = self.batch_spin.value()
+        hf_id, fw_size = self.cb_model.currentData()
+        engine = self.cb_engine.currentData()
 
-        # Check cache — skip if already loaded
-        cache_key = (engine, model_size if engine in ("whispercpp", "faster_whisper") else model_id)
-        if self._loaded_model_key == cache_key and self.backend is not None:
-            if not auto:
-                self.status_label.setText(f"Model already loaded: {model_size}")
+        self._set_busy(True, f"Loading model: {fw_size} ({engine})...")
+
+        self._model_thread = ModelLoadThread(engine, hf_id, fw_size)
+        self._model_thread.done.connect(self._on_model_loaded)
+        self._model_thread.error.connect(self._on_model_error)
+        self._model_thread.start()
+
+    def _auto_load_model(self):
+        """Called on app startup to preload default model."""
+        if ENGINE.is_loaded:
+            self.lbl_status.setText("Model already loaded. Load audio to begin.")
             return
 
-        # Warn about unsupported combos
-        if engine == "whispercpp" and is_distil:
-            if not auto:
-                QMessageBox.warning(self, "Unsupported",
-                    "whisper.cpp doesn't support distil models.\n"
-                    "Use faster-whisper or HF pipeline instead.")
-            return
+        hf_id, fw_size = self.cb_model.currentData()
+        engine = self.cb_engine.currentData()
+        self.lbl_status.setText(f"Auto-loading {fw_size}...")
+        self.btn_load_model.setEnabled(False)
 
-        label = f"Loading {model_size} ({engine})..."
-        if auto:
-            self.status_label.setText(f"Auto-preloading: {label}")
-            self.load_model_btn.setEnabled(False)
+        self._model_thread = ModelLoadThread(engine, hf_id, fw_size)
+        self._model_thread.done.connect(self._on_model_loaded)
+        self._model_thread.error.connect(self._on_model_error)
+        self._model_thread.start()
+
+    def _on_model_loaded(self, ok, msg, elapsed):
+        self._set_busy(False)
+        if ok:
+            self.lbl_status.setText(f"✓ {msg}")
+            self.lbl_speed.setText(f"Engine: {ENGINE.engine_type}")
         else:
-            self.set_busy(True, label)
+            self.lbl_status.setText(f"✗ Model load failed: {msg}")
+            QMessageBox.critical(self, "Model Error", msg)
 
-        self.model_thread = ModelLoaderThread(engine, model_id, model_size, bs)
-        self.model_thread.finished_ok.connect(
-            lambda b, d, i, t: self._on_model_ok(b, d, i, t, auto, cache_key))
-        self.model_thread.failed.connect(lambda m: self._on_model_fail(m, auto))
-        self.model_thread.start()
+    def _on_model_error(self, msg):
+        self._set_busy(False)
+        self.lbl_status.setText(f"✗ Model error: {msg}")
+        QMessageBox.critical(self, "Model Error", msg)
 
-    def _on_model_ok(self, backend, device, info, elapsed, auto, cache_key):
-        self.backend = backend
-        self.device = device
-        self._loaded_model_key = cache_key
+    # ══════════════════════════════════════════════════════════════════════
+    #  VAD AUTO-SEGMENTATION
+    # ══════════════════════════════════════════════════════════════════════
 
-        if elapsed < 0.1:
-            msg = f"Model ready (cached): {info}"
-        else:
-            msg = f"Model ready in {elapsed:.1f}s: {info}"
-
-        if auto:
-            self.status_label.setText(msg)
-            self.load_model_btn.setEnabled(True)
-        else:
-            self.set_busy(False, msg)
-        self.speed_label.setText(f"Engine: {backend.NAME}")
-
-    def _on_model_fail(self, msg, auto):
-        if auto:
-            self.status_label.setText(f"Auto-load failed: {msg}")
-            self.load_model_btn.setEnabled(True)
-        else:
-            self.set_busy(False, "Model load failed.")
-            QMessageBox.critical(self, "Error", msg)
-
-    # ── VAD ───────────────────────────────────────────────────────────────
-    def run_auto_segmentation(self):
+    def on_run_vad(self):
         if self.y is None:
-            QMessageBox.warning(self, "No Audio", "Load audio first."); return
-        p = {"min_silence_ms": self.vad_sil.value(), "silence_thresh_db": self.vad_db.value(),
-             "min_segment_ms": self.vad_min.value(), "max_segment_ms": self.vad_max.value()}
-        self.set_busy(True, "Running VAD...")
-        self.seg_thread = SegmentationThread(self.y, self.sr, p)
-        self.seg_thread.finished_ok.connect(self._on_vad_ok)
-        self.seg_thread.failed.connect(lambda m: (self.set_busy(False), QMessageBox.critical(self,"Error",m)))
-        self.seg_thread.start()
-
-    def _on_vad_ok(self, segs):
-        self.gt_rows = [{"label": f"seg_{i+1:04d}", "start": s["start"], "end": s["end"]}
-                        for i, s in enumerate(segs)]
-        self.results = []; self.selected_index = None
-        self.set_busy(False, f"VAD: {len(segs)} segments")
-        self.refresh_list(); self.redraw()
-
-    # ── Inference (with streaming) ────────────────────────────────────────
-    def run_inference(self):
-        if self.y is None:
-            QMessageBox.warning(self, "Missing", "Load audio first."); return
-        if not self.gt_rows:
-            QMessageBox.warning(self, "Missing", "Load GT or run VAD."); return
-        if self.backend is None:
-            QMessageBox.warning(self, "Missing", "Load model first."); return
-        if self.infer_thread and self.infer_thread.isRunning():
+            QMessageBox.warning(self, "No Audio", "Load an audio file first.")
             return
 
-        lang_code, lang_name = self.lang_combo.currentData()
-        mode = self.mode_combo.currentData()
-        self.results = [None] * len(self.gt_rows)
-        self.progress_bar.setValue(0)
-        self._infer_start_time = time.time()
-        self.set_busy(True, "Running prediction...")
+        params = {
+            "silence_ms": self.sp_silence.value(),
+            "thresh_db": self.sp_thresh.value(),
+            "min_ms": self.sp_min_seg.value(),
+            "max_ms": self.sp_max_seg.value(),
+        }
+        self._set_busy(True, "Running VAD segmentation...")
 
-        self.infer_thread = InferenceThread(
-            self.backend, self.y16, TARGET_SR, self.gt_rows,
-            lang_code, lang_name, mode)
-        self.infer_thread.segment_done.connect(self._on_segment_result)
-        self.infer_thread.progress.connect(self._on_infer_prog)
-        self.infer_thread.finished_ok.connect(self._on_infer_done)
-        self.infer_thread.failed.connect(self._on_infer_fail)
-        self.infer_thread.start()
+        self._vad_thread = VADThread(self.y, self.sr, params)
+        self._vad_thread.done.connect(self._on_vad_done)
+        self._vad_thread.error.connect(lambda m: (
+            self._set_busy(False), QMessageBox.critical(self, "VAD Error", m)))
+        self._vad_thread.start()
 
-    def _on_segment_result(self, idx, result):
-        """Stream each result into the list as it arrives."""
-        if 0 <= idx < len(self.results):
-            self.results[idx] = result
-            # Update just this row in the segment list
-            if idx < self.seg_list.count():
-                r = result
-                sc = r["score"]
-                sc_str = f"{sc:.2f}"
-                text = (f"{idx+1:03d} | GT: {r['gt']}  →  PRED: {r['pred'] or '—'}"
-                        f"  | {r['gt_start']:.2f}-{r['gt_end']:.2f}s  acc={sc_str}")
-                self.seg_list.item(idx).setText(text)
-                if sc >= 0.95:
-                    self.seg_list.item(idx).setForeground(Qt.darkGreen)
-                elif sc >= 0.5:
-                    self.seg_list.item(idx).setForeground(Qt.darkYellow)
-                else:
-                    self.seg_list.item(idx).setForeground(Qt.red)
+    def _on_vad_done(self, raw_segs):
+        self.segments = [
+            {"label": f"seg_{i+1:04d}", "start": s["start"], "end": s["end"]}
+            for i, s in enumerate(raw_segs)
+        ]
+        self.results = []
+        self.selected_idx = None
+        self._set_busy(False, f"VAD found {len(raw_segs)} segments")
+        self._refresh_list()
+        self._redraw()
 
-    def stop_inference(self):
-        if self.infer_thread and self.infer_thread.isRunning():
-            self.infer_thread.request_stop()
+    # ══════════════════════════════════════════════════════════════════════
+    #  RUN PREDICTION
+    # ══════════════════════════════════════════════════════════════════════
 
-    def _on_infer_prog(self, done, tot, pct):
-        elapsed = time.time() - self._infer_start_time
-        segs_per_sec = done / elapsed if elapsed > 0 else 0
-        eta = (tot - done) / segs_per_sec if segs_per_sec > 0 else 0
-        self.status_label.setText(f"Predicting {done}/{tot}  ({segs_per_sec:.1f} seg/s, ETA {eta:.0f}s)")
-        self.progress_bar.setValue(pct)
+    def on_run_prediction(self):
+        if self.y16 is None:
+            QMessageBox.warning(self, "No Audio", "Load an audio file first.")
+            return
+        if not self.segments:
+            QMessageBox.warning(self, "No Segments",
+                                "Load ground truth or run auto-segmentation first.")
+            return
+        if not ENGINE.is_loaded:
+            QMessageBox.warning(self, "No Model", "Load a model first.")
+            return
+        if self._pred_thread and self._pred_thread.isRunning():
+            return
 
-    def _on_infer_done(self, results, mean_acc):
+        lang_iso, lang_name = self.cb_lang.currentData()
+        mode = self.cb_mode.currentData()
+
+        self.results = []
+        self.progress.setValue(0)
+        self._pred_start_time = time.time()
+        self._set_busy(True, "Running prediction...")
+
+        # Pre-populate segment list with pending state
+        self._refresh_list()
+
+        self._pred_thread = PredictionThread(
+            self.y16, self.segments, lang_iso, lang_name, mode)
+        self._pred_thread.segment_result.connect(self._on_segment_result)
+        self._pred_thread.progress.connect(self._on_pred_progress)
+        self._pred_thread.done.connect(self._on_pred_done)
+        self._pred_thread.error.connect(self._on_pred_error)
+        self._pred_thread.start()
+
+    def _on_segment_result(self, idx, pred, acc):
+        """Update single segment in list as results stream in."""
+        if idx < self.seg_list.count():
+            seg = self.segments[idx]
+            text = self._format_seg_text(idx, seg["label"], pred, seg["start"], seg["end"], acc)
+            item = self.seg_list.item(idx)
+            item.setText(text)
+            if acc >= 0.95:
+                item.setForeground(Qt.darkGreen)
+            elif acc >= 0.5:
+                item.setForeground(Qt.darkYellow)
+            else:
+                item.setForeground(Qt.red)
+
+    def _on_pred_progress(self, done, total):
+        pct = int(done / total * 100) if total > 0 else 0
+        self.progress.setValue(pct)
+
+        elapsed = time.time() - self._pred_start_time
+        speed = done / elapsed if elapsed > 0 else 0
+        eta = (total - done) / speed if speed > 0 else 0
+        self.lbl_status.setText(
+            f"Predicting {done}/{total}  ({speed:.1f} seg/s, ETA {eta:.0f}s)")
+
+    def _on_pred_done(self, results, mean_acc, elapsed):
         self.results = results
-        elapsed = time.time() - self._infer_start_time
-        self.progress_bar.setValue(100)
-        self.set_busy(False,
-            f"Done: {len(results)} segs in {elapsed:.1f}s | "
-            f"Accuracy: {mean_acc:.3f} | "
-            f"Speed: {len(results)/elapsed:.1f} seg/s")
-        self.speed_label.setText(f"{len(results)/elapsed:.1f} seg/s | {elapsed:.1f}s total")
-        self.refresh_list(); self.redraw()
+        self.progress.setValue(100)
 
-    def _on_infer_fail(self, msg):
-        self.progress_bar.setValue(0)
-        self.set_busy(False, "Inference failed.")
-        QMessageBox.critical(self, "Error", msg)
+        n = len(results)
+        speed = n / elapsed if elapsed > 0 else 0
+        self._set_busy(False,
+            f"✓ Done: {n} segments in {elapsed:.1f}s  |  "
+            f"Mean accuracy: {mean_acc:.3f}  |  "
+            f"Speed: {speed:.1f} seg/s")
+        self.lbl_speed.setText(f"{speed:.1f} seg/s")
+        self._refresh_list()
+        self._redraw()
 
-    # ── Plot ──────────────────────────────────────────────────────────────
-    def redraw(self):
+    def _on_pred_error(self, msg):
+        self.progress.setValue(0)
+        self._set_busy(False, f"✗ Prediction failed: {msg}")
+        QMessageBox.critical(self, "Prediction Error", msg)
+
+    def on_stop_prediction(self):
+        if self._pred_thread and self._pred_thread.isRunning():
+            self._pred_thread.request_stop()
+            self.lbl_status.setText("Stopping...")
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  PLOT
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _redraw(self):
         self.ax.clear()
         if self.wave_t is None:
-            self.canvas.draw_idle(); return
+            self.canvas.draw_idle()
+            return
 
         self.ax.plot(self.wave_t, self.wave_y, lw=0.5, color="black")
         ymax = max(np.max(np.abs(self.wave_y)), 1e-6)
-        lang_code, _ = self.lang_combo.currentData()
-        fp = pick_font(lang_code)
 
-        data = [r for r in (self.results or []) if r is not None]
-        if not data:
-            data = [{"gt": r["label"], "pred": None,
-                     "gt_start": r["start"], "gt_end": r["end"],
-                     "pred_start": None, "pred_end": None, "score": None}
-                    for r in self.gt_rows]
+        lang_iso, _ = self.cb_lang.currentData()
+        fp = get_font(lang_iso)
 
+        # Get current viewport
         x0, x1 = self.ax.get_xlim()
         if x0 == 0.0 and x1 == 1.0 and self.y is not None:
             x1 = len(self.y) / self.sr
 
-        for idx, r in enumerate(data):
-            s, e = r["gt_start"], r["gt_end"]
+        # Draw segment regions (only visible ones)
+        for i, seg in enumerate(self.segments):
+            s, e = seg["start"], seg["end"]
             if e < x0 or s > x1:
-                continue
+                continue  # Skip off-screen
 
+            # Colour based on accuracy (if results exist)
             color = "green"
-            if r.get("score") is not None and r["score"] < 0.95:
-                color = "red"
-            self.ax.axvspan(s, e, alpha=0.10, color=color)
+            if self.results and i < len(self.results):
+                acc = self.results[i]["accuracy"]
+                color = "#16a34a" if acc >= 0.95 else ("#ea580c" if acc >= 0.5 else "#dc2626")
 
-            if self.selected_index is not None and idx == self.selected_index:
-                self.ax.axvspan(s, e, alpha=0.25, color="yellow")
+            self.ax.axvspan(s, e, alpha=0.12, color=color)
+
+            # Highlight selected
+            if self.selected_idx is not None and i == self.selected_idx:
+                self.ax.axvspan(s, e, alpha=0.3, color="yellow")
                 mid = (s + e) / 2
-                kw = {"fontproperties": fp} if fp else {}
-                self.ax.text(mid, ymax*0.95, f"GT: {r['gt']}",
-                             ha="center", va="bottom", fontsize=10, color="green",
-                             fontweight="bold",
-                             bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=2), **kw)
-                if r.get("pred") is not None:
-                    shown = r["pred"] or "∅"
-                    self.ax.text(mid, ymax*0.72, f"PRED: {shown}",
-                                 ha="center", va="bottom", fontsize=10, color="blue",
-                                 fontweight="bold",
-                                 bbox=dict(facecolor="white", alpha=0.7, edgecolor="none", pad=2), **kw)
+                fkw = {"fontproperties": fp} if fp else {}
+                bbox = dict(facecolor="white", alpha=0.85, edgecolor="none", pad=2)
 
+                self.ax.text(mid, ymax * 0.95, f"GT: {seg['label']}",
+                             ha="center", va="bottom", fontsize=10,
+                             color="green", fontweight="bold", bbox=bbox, **fkw)
+
+                if self.results and i < len(self.results):
+                    pred = self.results[i]["pred"] or "∅"
+                    acc = self.results[i]["accuracy"]
+                    self.ax.text(mid, ymax * 0.72,
+                                 f"PRED: {pred}  (acc={acc:.2f})",
+                                 ha="center", va="bottom", fontsize=10,
+                                 color="blue", fontweight="bold", bbox=bbox, **fkw)
+
+        # Title
         title = "Waveform"
-        scores = [r["score"] for r in data if r.get("score") is not None]
-        if scores:
-            title += f" | Accuracy = {np.mean(scores):.3f}"
+        if self.results:
+            mean = np.mean([r["accuracy"] for r in self.results])
+            title += f"  |  Mean accuracy = {mean:.3f}"
         self.ax.set_title(title)
-        self.ax.set_xlabel("Time (s)"); self.ax.set_ylabel("Amplitude")
+        self.ax.set_xlabel("Time (s)")
+        self.ax.set_ylabel("Amplitude")
         self.canvas.draw_idle()
 
-    # ── Segment List ──────────────────────────────────────────────────────
-    def refresh_list(self):
-        self.seg_list.clear()
-        valid = [r for r in (self.results or []) if r is not None]
-        src = valid if valid else [
-            {"gt": r["label"], "pred": "", "gt_start": r["start"],
-             "gt_end": r["end"], "score": None}
-            for r in self.gt_rows]
+    # ══════════════════════════════════════════════════════════════════════
+    #  SEGMENT LIST
+    # ══════════════════════════════════════════════════════════════════════
 
-        for i, r in enumerate(src):
-            sc = r.get("score")
-            sc_str = f"{sc:.2f}" if sc is not None else "  — "
-            pred = r.get("pred", "") or "—"
-            text = f"{i+1:03d} | GT: {r['gt']}  →  PRED: {pred}  | {r['gt_start']:.2f}-{r['gt_end']:.2f}s  acc={sc_str}"
-            item = QListWidgetItem(text)
-            if sc is not None:
-                if sc >= 0.95:   item.setForeground(Qt.darkGreen)
-                elif sc >= 0.5:  item.setForeground(Qt.darkYellow)
-                else:            item.setForeground(Qt.red)
+    @staticmethod
+    def _format_seg_text(idx, gt, pred, start, end, acc):
+        pred_str = pred if pred else "—"
+        if acc is not None:
+            return f"{idx+1:03d} │ GT: {gt}  →  PRED: {pred_str}  │ {start:.2f}-{end:.2f}s  acc={acc:.2f}"
+        else:
+            return f"{idx+1:03d} │ GT: {gt}  →  PRED: ...  │ {start:.2f}-{end:.2f}s"
+
+    def _refresh_list(self):
+        self.seg_list.clear()
+        for i, seg in enumerate(self.segments):
+            gt = seg["label"]
+            start, end = seg["start"], seg["end"]
+
+            if self.results and i < len(self.results):
+                r = self.results[i]
+                text = self._format_seg_text(i, gt, r["pred"], start, end, r["accuracy"])
+                item = QListWidgetItem(text)
+                acc = r["accuracy"]
+                if acc >= 0.95:
+                    item.setForeground(Qt.darkGreen)
+                elif acc >= 0.5:
+                    item.setForeground(Qt.darkYellow)
+                else:
+                    item.setForeground(Qt.red)
+            else:
+                text = self._format_seg_text(i, gt, None, start, end, None)
+                item = QListWidgetItem(text)
+
             self.seg_list.addItem(item)
 
-    def on_segment_clicked(self, item):
+    def on_seg_clicked(self, item):
         idx = self.seg_list.row(item)
-        self.selected_index = idx
-        valid = [r for r in (self.results or []) if r is not None]
-        src = valid if valid else [{"gt_start": r["start"], "gt_end": r["end"]} for r in self.gt_rows]
-        if 0 <= idx < len(src):
-            s, e = src[idx]["gt_start"], src[idx]["gt_end"]
-            pad = max(0.3, (e - s) * 0.2)
+        self.selected_idx = idx
+
+        if 0 <= idx < len(self.segments):
+            seg = self.segments[idx]
+            s, e = seg["start"], seg["end"]
+            pad = max(0.3, (e - s) * 0.3)
             self.ax.set_xlim(max(0, s - pad), e + pad)
-            self.redraw()
+            self._redraw()
 
-    # ── Audio ─────────────────────────────────────────────────────────────
-    def play_audio(self):
-        if self.y is not None: sd.stop(); sd.play(self.y, self.sr)
+    # ══════════════════════════════════════════════════════════════════════
+    #  PLAYBACK
+    # ══════════════════════════════════════════════════════════════════════
 
-    def play_selected_segment(self):
-        if self.selected_index is None: return
-        valid = [r for r in (self.results or []) if r is not None]
-        src = valid if valid else [{"gt_start": r["start"], "gt_end": r["end"]} for r in self.gt_rows]
-        if 0 <= self.selected_index < len(src):
-            s, e = src[self.selected_index]["gt_start"], src[self.selected_index]["gt_end"]
-            sd.stop(); sd.play(self.y[int(s*self.sr):int(e*self.sr)], self.sr)
+    def on_play_segment(self):
+        if self.selected_idx is None or self.y is None:
+            return
+        if 0 <= self.selected_idx < len(self.segments):
+            seg = self.segments[self.selected_idx]
+            s = int(seg["start"] * self.sr)
+            e = int(seg["end"] * self.sr)
+            sd.stop()
+            sd.play(self.y[s:e], self.sr)
 
-    def stop_audio(self): sd.stop()
+    # ══════════════════════════════════════════════════════════════════════
+    #  ZOOM
+    # ══════════════════════════════════════════════════════════════════════
 
-    # ── Zoom ──────────────────────────────────────────────────────────────
-    def zoom(self, factor):
-        if self.y is None: return
-        x0, x1 = self.ax.get_xlim(); c = (x0+x1)/2; w = (x1-x0)*factor/2
-        tot = len(self.y)/self.sr
-        self.ax.set_xlim(max(0, c-w), min(tot, c+w)); self.redraw()
-
-    def on_scroll(self, event):
-        if self.y is None: return
+    def _zoom(self, factor):
+        if self.y is None:
+            return
         x0, x1 = self.ax.get_xlim()
-        mx = event.xdata if event.xdata else (x0+x1)/2
-        s = 0.6 if event.button == "up" else 1.6
-        tot = len(self.y)/self.sr
-        self.ax.set_xlim(max(0, mx-(mx-x0)*s), min(tot, mx+(x1-mx)*s)); self.redraw()
+        c = (x0 + x1) / 2
+        w = (x1 - x0) * factor / 2
+        total = len(self.y) / self.sr
+        self.ax.set_xlim(max(0, c - w), min(total, c + w))
+        self._redraw()
 
-    def reset_plot_view(self):
+    def _on_scroll(self, event):
+        if self.y is None:
+            return
+        x0, x1 = self.ax.get_xlim()
+        mx = event.xdata if event.xdata else (x0 + x1) / 2
+        f = 0.6 if event.button == "up" else 1.6
+        total = len(self.y) / self.sr
+        self.ax.set_xlim(
+            max(0, mx - (mx - x0) * f),
+            min(total, mx + (x1 - mx) * f))
+        self._redraw()
+
+    def _reset_view(self):
         if self.y is not None:
-            self.ax.set_xlim(0, len(self.y)/self.sr); self.redraw()
+            self.ax.set_xlim(0, len(self.y) / self.sr)
+            self._redraw()
 
-    # ── Export ────────────────────────────────────────────────────────────
-    def export_csv(self):
-        valid = [r for r in (self.results or []) if r is not None]
-        if not valid:
-            QMessageBox.warning(self, "No Results", "Run prediction first."); return
-        path, _ = QFileDialog.getSaveFileName(self, "Save CSV", "results.csv", "CSV (*.csv)")
-        if not path: return
+    # ══════════════════════════════════════════════════════════════════════
+    #  EXPORT
+    # ══════════════════════════════════════════════════════════════════════
+
+    def on_export_csv(self):
+        if not self.results:
+            QMessageBox.warning(self, "No Results", "Run prediction first.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Results", "results.csv", "CSV (*.csv)")
+        if not path:
+            return
+
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
-                w.writerow(["index","ground_truth","prediction","accuracy","gt_start","gt_end"])
-                for i, r in enumerate(valid):
-                    w.writerow([i+1, r["gt"], r["pred"], f"{r['score']:.4f}",
-                                f"{r['gt_start']:.4f}", f"{r['gt_end']:.4f}"])
-            self.status_label.setText(f"Exported: {path}")
+                w.writerow(["index", "ground_truth", "prediction",
+                            "accuracy", "start_sec", "end_sec"])
+                for r in self.results:
+                    w.writerow([
+                        r["index"] + 1,
+                        r["gt"],
+                        r["pred"],
+                        f"{r['accuracy']:.4f}",
+                        f"{r['start']:.4f}",
+                        f"{r['end']:.4f}",
+                    ])
+            self.lbl_status.setText(f"Exported: {path}")
+            log(f"CSV exported: {path}")
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            QMessageBox.critical(self, "Export Error", str(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  Indic Annotation Tool  [ULTRA-FAST]")
-    print(f"  Engines: whisper.cpp={HAS_WHISPERCPP}  "
-          f"faster-whisper={HAS_FASTER_WHISPER}  HF={HAS_HF}")
-    print(f"  CPU threads: {CPU_THREADS}")
-    if HAS_HF:
-        import torch as _t
-        print(f"  CUDA: {_t.cuda.is_available()}"
-              + (f" ({_t.cuda.get_device_name(0)})" if _t.cuda.is_available() else ""))
-    print("=" * 60)
+    print("=" * 65)
+    print("  Indic Speech Annotation Tool")
+    print(f"  Engines available:")
+    if _HAS_FASTER_WHISPER:
+        print(f"    ✓ faster-whisper (CTranslate2, int8, {CPU_THREADS} threads)")
+    else:
+        print(f"    ✗ faster-whisper  → pip install faster-whisper")
+    if _HAS_HF:
+        cuda = torch.cuda.is_available()
+        gpu = f" ({torch.cuda.get_device_name(0)})" if cuda else ""
+        print(f"    ✓ HuggingFace transformers (CUDA={cuda}{gpu})")
+    else:
+        print(f"    ✗ HuggingFace  → pip install transformers torch")
+    print(f"  Audio I/O: soundfile={'✓' if _HAS_SF else '✗'}  scipy={'✓' if _HAS_SCIPY else '✗'}")
+    print("=" * 65)
 
     app = QApplication(sys.argv)
     app.setStyleSheet("""
-        QPushButton { padding:5px 10px; border:1px solid #d1d5db; border-radius:4px;
-                      background:#f9fafb; font-size:12px; }
-        QPushButton:hover { background:#e5e7eb; }
-        QPushButton:disabled { color:#9ca3af; }
-        QComboBox, QSpinBox, QDoubleSpinBox { padding:3px 6px; font-size:12px; }
+        QPushButton {
+            padding: 5px 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            background: #f9fafb;
+            font-size: 12px;
+        }
+        QPushButton:hover { background: #e5e7eb; }
+        QPushButton:pressed { background: #d1d5db; }
+        QPushButton:disabled { color: #9ca3af; background: #f3f4f6; }
+        QComboBox, QSpinBox, QDoubleSpinBox {
+            padding: 3px 6px; font-size: 12px;
+        }
     """)
-    w = AnnotationTool()
-    w.show()
+
+    window = MainWindow()
+    window.show()
     sys.exit(app.exec_())
