@@ -72,7 +72,7 @@ if not _HF and not _FW:
     print("ERROR: pip install transformers torch torchaudio  (or)  pip install faster-whisper")
     sys.exit(1)
 
-# ══════════════════════════════════════════════════════════════════════════
+
 SR16 = 16000
 CPU_THR = max(1, min(os.cpu_count() or 4, 8))
 
@@ -121,7 +121,7 @@ PRED_MODES = [
     ("First Character",  "char"),
 ]
 
-# ── Unicode ──────────────────────────────────────────────────────────────
+
 _INDIC = (
     r"\u0900-\u097F"   # Devanagari
     r"\uA8E0-\uA8FF"   # Devanagari Extended
@@ -143,10 +143,6 @@ _RE_ALPHA  = re.compile(rf"[A-Za-z{_INDIC}]", re.UNICODE)
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-
-# ══════════════════════════════════════════════════════════════════════════
-#  UTILITIES
-# ══════════════════════════════════════════════════════════════════════════
 def clean_text(text, mode="full"):
     if not text: return ""
     text = _RE_CLEAN.sub("", str(text).strip())
@@ -1162,7 +1158,7 @@ class MainWindow(QMainWindow):
 # ══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Indic Speech Annotation Tool v3")
+    print("  Indic Speech Annotation Tool ")
     print(f"  Engines: IndicConformer={'✓' if _HF else '✗'}  "
           f"faster-whisper={'✓' if _FW else '✗'}  HF={'✓' if _HF else '✗'}")
     if _HF:
