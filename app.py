@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """
-Indic Speech Annotation & Segmentation Tool v3
-================================================
-Purpose-built for Indian languages with proper script output.
+Indic Speech Annotation & Segmentation Tool — Auto-Mode Edition
+================================================================
+Auto-detects segment types and applies the correct prediction mode:
+  • Single character (અ, आ, க) → First Character mode
+  • Single word (ગુજરાત, भारत)  → First Word mode
+  • S1-S5 / Paragraph labels     → Full Transcript + compare against txt file
+  • Multi-word text              → Full Transcript mode
 
-Engines (in order of Indic accuracy):
-  1. AI4Bharat IndicConformer-600M  — best for Gu/Hi/Mr (correct script!)
-  2. faster-whisper                 — fast but may output wrong script
-  3. HuggingFace Whisper            — fallback
+Transcript files: Place .txt files in 'transcripts/' folder next to app.py.
+  transcripts/gu.txt, transcripts/hi.txt, transcripts/mr.txt, etc.
+  Format:  [S1]\\nExpected sentence text\\n[S2]\\n...\\n[Paragraph]\\n...
 
 Install:
-    pip install transformers torchaudio torch soundfile scipy \
+    pip install transformers torchaudio torch soundfile scipy \\
                 numpy pandas matplotlib PyQt5 sounddevice openpyxl
-
-For faster-whisper (optional):
-    pip install faster-whisper
 """
 
 import os, sys, csv, re, time, traceback
 from datetime import datetime
 from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -40,7 +41,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QDoubleSpinBox, QSpinBox, QTabWidget,
 )
 
-# ── Imports with availability flags ──────────────────────────────────────
+# ── Optional imports ─────────────────────────────────────────────────────
 try:
     import soundfile as sf
     _SF = True
@@ -55,8 +56,7 @@ except ImportError:
     _SCIPY = False
 
 try:
-    import torch
-    import torchaudio
+    import torch, torchaudio
     from transformers import AutoModel, AutoModelForSpeechSeq2Seq, AutoProcessor
     _HF = True
 except ImportError:
@@ -72,12 +72,13 @@ if not _HF and not _FW:
     print("ERROR: pip install transformers torch torchaudio  (or)  pip install faster-whisper")
     sys.exit(1)
 
-
+# ══════════════════════════════════════════════════════════════════════════
 SR16 = 16000
 CPU_THR = max(1, min(os.cpu_count() or 4, 8))
+APP_DIR = Path(__file__).parent.resolve()
+TRANSCRIPTS_DIR = APP_DIR / "transcripts"
 
 # ── Models ───────────────────────────────────────────────────────────────
-# (display, engine_key, model_id_or_size, notes)
 MODELS = []
 if _HF:
     MODELS += [
@@ -87,17 +88,17 @@ if _HF:
     ]
 if _FW:
     MODELS += [
-        ("faster-whisper tiny  (fastest)",    "fw", "tiny",     "May output wrong script for Indic"),
-        ("faster-whisper base",               "fw", "base",     "May output wrong script for Indic"),
-        ("faster-whisper small",              "fw", "small",    "May output wrong script for Indic"),
-        ("faster-whisper medium",             "fw", "medium",   "Better Indic but still may mix scripts"),
-        ("faster-whisper large-v3",           "fw", "large-v3", "Best Whisper, but not Indic-native"),
+        ("faster-whisper tiny",    "fw", "tiny",     ""),
+        ("faster-whisper base",    "fw", "base",     ""),
+        ("faster-whisper small",   "fw", "small",    ""),
+        ("faster-whisper medium",  "fw", "medium",   ""),
+        ("faster-whisper large-v3","fw", "large-v3", ""),
     ]
 if _HF:
     MODELS += [
-        ("HF Whisper small",    "hf_whisper", "openai/whisper-small",    "May output wrong script"),
-        ("HF Whisper medium",   "hf_whisper", "openai/whisper-medium",   "May output wrong script"),
-        ("HF Whisper large-v3", "hf_whisper", "openai/whisper-large-v3", "Best generic Whisper"),
+        ("HF Whisper small",    "hf_whisper", "openai/whisper-small",    ""),
+        ("HF Whisper medium",   "hf_whisper", "openai/whisper-medium",   ""),
+        ("HF Whisper large-v3", "hf_whisper", "openai/whisper-large-v3", ""),
     ]
 
 LANGUAGES = [
@@ -115,34 +116,193 @@ LANGUAGES = [
     ("Assamese",  "as", "assamese"),
 ]
 
-PRED_MODES = [
-    ("Full Transcript", "full"),
-    ("First Word",      "word"),
-    ("First Character",  "char"),
-]
-
-
+# ── Unicode ──────────────────────────────────────────────────────────────
 _INDIC = (
-    r"\u0900-\u097F"   # Devanagari
-    r"\uA8E0-\uA8FF"   # Devanagari Extended
-    r"\u0A80-\u0AFF"   # Gujarati
-    r"\u0980-\u09FF"   # Bengali
-    r"\u0B00-\u0B7F"   # Odia
-    r"\u0B80-\u0BFF"   # Tamil
-    r"\u0C00-\u0C7F"   # Telugu
-    r"\u0C80-\u0CFF"   # Kannada
-    r"\u0D00-\u0D7F"   # Malayalam
-    r"\u0A00-\u0A7F"   # Gurmukhi (Punjabi)
+    r"\u0900-\u097F\uA8E0-\uA8FF"  # Devanagari
+    r"\u0A80-\u0AFF"                 # Gujarati
+    r"\u0980-\u09FF"                 # Bengali
+    r"\u0B00-\u0B7F"                 # Odia
+    r"\u0B80-\u0BFF"                 # Tamil
+    r"\u0C00-\u0C7F"                 # Telugu
+    r"\u0C80-\u0CFF"                 # Kannada
+    r"\u0D00-\u0D7F"                 # Malayalam
+    r"\u0A00-\u0A7F"                 # Gurmukhi
 )
 _RE_CLEAN  = re.compile(rf"[^A-Za-z0-9\s{_INDIC}.,!?'\-]", re.UNICODE)
 _RE_SPACES = re.compile(r"\s+")
 _RE_NORM   = re.compile(rf"[^a-z0-9{_INDIC}]", re.UNICODE)
 _RE_ALPHA  = re.compile(rf"[A-Za-z{_INDIC}]", re.UNICODE)
 
+# Sequence label pattern
+_RE_SEQ = re.compile(r"^(?:s|p|sent|para|sentence|paragraph|section|seg)\s*\d*$", re.I)
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TRANSCRIPT STORE — loads S1-S5 / Paragraph text from .txt files
+# ══════════════════════════════════════════════════════════════════════════
+class TranscriptStore:
+    """
+    Loads and manages transcript reference files.
+    File format (transcripts/gu.txt):
+
+        [S1]
+        Expected sentence text for S1
+        [S2]
+        Expected sentence text for S2
+        ...
+        [Paragraph]
+        Full paragraph text here
+    """
+
+    def __init__(self):
+        self.data = {}       # {"s1": "text...", "s2": "text...", "paragraph": "text..."}
+        self.lang_code = None
+        self.file_path = None
+
+    def load(self, lang_iso: str) -> tuple:
+        """Load transcript file for given language. Returns (success, message)."""
+        self.data = {}
+        self.lang_code = lang_iso
+        self.file_path = TRANSCRIPTS_DIR / f"{lang_iso}.txt"
+
+        if not self.file_path.exists():
+            return False, f"No transcript file: {self.file_path}"
+
+        try:
+            text = self.file_path.read_text(encoding="utf-8")
+            current_key = None
+            current_lines = []
+
+            for line in text.splitlines():
+                line_stripped = line.strip()
+
+                # Skip comments and empty lines (when not inside a section)
+                if line_stripped.startswith("#"):
+                    continue
+
+                # Check for section header: [S1], [S2], [Paragraph], etc.
+                m = re.match(r"^\[(.+?)\]$", line_stripped)
+                if m:
+                    # Save previous section
+                    if current_key is not None:
+                        self.data[current_key] = "\n".join(current_lines).strip()
+                    current_key = m.group(1).strip().lower()
+                    current_lines = []
+                elif current_key is not None:
+                    current_lines.append(line.rstrip())
+
+            # Save last section
+            if current_key is not None:
+                self.data[current_key] = "\n".join(current_lines).strip()
+
+            n = len(self.data)
+            keys = ", ".join(sorted(self.data.keys()))
+            log(f"Transcript loaded: {self.file_path.name} → {n} sections: {keys}")
+            return True, f"Loaded {n} sections from {self.file_path.name}"
+
+        except Exception as e:
+            return False, f"Error reading {self.file_path}: {e}"
+
+    def get_reference(self, label: str) -> str:
+        """Get expected transcript text for a sequence label like S1, Paragraph, etc."""
+        key = label.strip().lower()
+        return self.data.get(key, "")
+
+    @property
+    def is_loaded(self):
+        return bool(self.data)
+
+    @property
+    def sections(self):
+        return list(self.data.keys())
+
+
+TRANSCRIPTS = TranscriptStore()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  SEGMENT CLASSIFIER — auto-detects char / word / sentence
+# ══════════════════════════════════════════════════════════════════════════
+
+def is_sequence_label(label: str) -> bool:
+    """Check if label is a sequence marker (S1, Paragraph, etc.)."""
+    label = str(label).strip()
+    if not label:
+        return False
+    if _RE_SEQ.match(label):
+        return True
+    if label.lower() in {"paragraph", "para", "passage"}:
+        return True
+    return False
+
+
+def classify_segment(label: str) -> dict:
+    """
+    Auto-classify a segment label and return processing instructions.
+
+    Returns dict with:
+        type:       "char" | "word" | "sentence" | "paragraph"
+        mode:       "char" | "word" | "full"  (passed to clean_text)
+        compare_to: what to compare prediction against (label itself or transcript text)
+        is_seq:     True if this is a sequence label (S1, Paragraph, etc.)
+
+    Classification logic:
+        1. Label matches S1-S5/Paragraph → "sentence"/"paragraph", compare to txt file
+        2. Label is 1 character → "char"
+        3. Label is 1 word (no spaces) → "word"
+        4. Label has multiple words → "sentence" (full transcript)
+    """
+    label = str(label).strip()
+    label_lower = label.lower()
+
+    # ── 1. Sequence labels: S1, S2, ..., Paragraph ──────────────────────
+    if is_sequence_label(label):
+        ref = TRANSCRIPTS.get_reference(label)
+        seg_type = "paragraph" if "para" in label_lower or "passage" in label_lower else "sentence"
+        return {
+            "type": seg_type,
+            "mode": "full",
+            "compare_to": ref if ref else None,  # None = no accuracy comparison
+            "is_seq": True,
+            "ref_key": label,
+        }
+
+    # ── 2. Single character (vowel or consonant) ────────────────────────
+    # Strip spaces and check if what remains is a single character
+    chars_only = re.sub(r"\s+", "", label)
+    if len(chars_only) == 1:
+        return {
+            "type": "char",
+            "mode": "char",
+            "compare_to": label,
+            "is_seq": False,
+        }
+
+    # ── 3. Single word (no spaces) ──────────────────────────────────────
+    words = label.split()
+    if len(words) == 1:
+        return {
+            "type": "word",
+            "mode": "word",
+            "compare_to": label,
+            "is_seq": False,
+        }
+
+    # ── 4. Multi-word → sentence ────────────────────────────────────────
+    return {
+        "type": "sentence",
+        "mode": "full",
+        "compare_to": label,
+        "is_seq": False,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  TEXT UTILITIES
+# ══════════════════════════════════════════════════════════════════════════
 def clean_text(text, mode="full"):
     if not text: return ""
     text = _RE_CLEAN.sub("", str(text).strip())
@@ -155,10 +315,8 @@ def clean_text(text, mode="full"):
         return m.group(0) if m else ""
     return text
 
-
 def norm_text(s):
     return _RE_NORM.sub("", str(s).strip().lower())
-
 
 def edit_distance(a, b):
     na, nb = len(a), len(b)
@@ -173,13 +331,11 @@ def edit_distance(a, b):
             prev = tmp
     return dp[nb]
 
-
 def accuracy(pred, gt):
     p, g = norm_text(pred), norm_text(gt)
     if not g and not p: return 1.0
     if not g: return 0.0
     return max(0.0, 1.0 - edit_distance(p, g) / len(g))
-
 
 def load_audio(path):
     if _SF:
@@ -187,12 +343,9 @@ def load_audio(path):
             data, sr = sf.read(path, dtype="float32", always_2d=True)
             y = data.mean(axis=1) if data.shape[1] > 1 else data[:, 0]
             return y.astype(np.float32), sr
-        except Exception:
-            pass
+        except Exception: pass
     import librosa
-    y, sr = librosa.load(path, sr=None, mono=True)
-    return y.astype(np.float32), sr
-
+    return librosa.load(path, sr=None, mono=True)[0].astype(np.float32), librosa.load(path, sr=None, mono=True)[1]
 
 def resample_audio(y, orig_sr, target_sr):
     if orig_sr == target_sr: return y
@@ -202,7 +355,6 @@ def resample_audio(y, orig_sr, target_sr):
     import librosa
     return librosa.resample(y, orig_sr=orig_sr, target_sr=target_sr).astype(np.float32)
 
-
 def parse_time(x):
     if pd.isna(x): return None
     x = str(x).strip()
@@ -211,11 +363,9 @@ def parse_time(x):
         try:
             dt = datetime.strptime(x, fmt)
             return dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
-        except ValueError:
-            continue
+        except ValueError: continue
     try: return float(x)
     except ValueError: return None
-
 
 @lru_cache(maxsize=12)
 def get_font(lang_code):
@@ -240,18 +390,14 @@ def get_font(lang_code):
         if not os.path.isdir(d): continue
         for root, _, files in os.walk(d):
             for fn in filenames:
-                if fn in files:
-                    return fm.FontProperties(fname=os.path.join(root, fn))
+                if fn in files: return fm.FontProperties(fname=os.path.join(root, fn))
     installed = {f.name for f in fm.fontManager.ttflist}
     for fam in families:
         if fam in installed: return fm.FontProperties(family=fam)
     return None
 
-
-# ── VAD ──────────────────────────────────────────────────────────────────
 def vad_segment(y, sr, silence_ms=300, thresh_db=-40, min_ms=200, max_ms=10000):
-    frame_len = int(sr * 0.025)
-    hop = int(sr * 0.010)
+    frame_len = int(sr * 0.025); hop = int(sr * 0.010)
     n_frames = 1 + (len(y) - frame_len) // hop
     if n_frames <= 0: return []
     idx = np.arange(frame_len)[None, :] + np.arange(n_frames)[:, None] * hop
@@ -288,142 +434,91 @@ def vad_segment(y, sr, silence_ms=300, thresh_db=-40, min_ms=200, max_ms=10000):
 # ══════════════════════════════════════════════════════════════════════════
 class Engine:
     def __init__(self):
-        self.backend = None       # the actual model object
-        self.engine_key = None    # "indicconformer", "fw", "hf_whisper"
-        self.processor = None     # HF whisper only
+        self.backend = None
+        self.engine_key = None
+        self.processor = None
         self.device = None
         self._cache_key = None
 
     @property
-    def is_loaded(self):
-        return self.backend is not None
+    def is_loaded(self): return self.backend is not None
 
     def load(self, engine_key, model_id):
-        cache_key = (engine_key, model_id)
-        if self._cache_key == cache_key and self.backend is not None:
+        ck = (engine_key, model_id)
+        if self._cache_key == ck and self.backend is not None:
             return True, f"Already loaded: {model_id}", 0.0
-
         t0 = time.time()
         self.backend = self.processor = None
         self.engine_key = engine_key
-
         try:
-            if engine_key == "indicconformer":
-                self._load_indicconformer(model_id)
-            elif engine_key == "fw":
-                self._load_faster_whisper(model_id)
-            elif engine_key == "hf_whisper":
-                self._load_hf_whisper(model_id)
-            else:
-                return False, f"Unknown engine: {engine_key}", 0.0
-
-            self._cache_key = cache_key
-            elapsed = time.time() - t0
-            return True, f"Loaded {model_id} in {elapsed:.1f}s", elapsed
+            if engine_key == "indicconformer": self._load_ic(model_id)
+            elif engine_key == "fw": self._load_fw(model_id)
+            elif engine_key == "hf_whisper": self._load_hf(model_id)
+            else: return False, f"Unknown engine: {engine_key}", 0.0
+            self._cache_key = ck
+            return True, f"Loaded {model_id} in {time.time()-t0:.1f}s", time.time()-t0
         except Exception as e:
-            traceback.print_exc()
-            self.backend = None
-            return False, str(e), time.time() - t0
+            traceback.print_exc(); self.backend = None
+            return False, str(e), time.time()-t0
 
-    # ── IndicConformer ────────────────────────────────────────────────────
-    def _load_indicconformer(self, model_id):
-        log(f"Loading IndicConformer: {model_id}")
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.backend = AutoModel.from_pretrained(
-            model_id, trust_remote_code=True
-        )
-        # Move to device if the model supports .to()
+    def _load_ic(self, mid):
+        log(f"Loading IndicConformer: {mid}")
+        self.device = "cuda" if (_HF and torch.cuda.is_available()) else "cpu"
+        self.backend = AutoModel.from_pretrained(mid, trust_remote_code=True)
         if hasattr(self.backend, 'to'):
-            try:
-                self.backend = self.backend.to(self.device)
-            except Exception:
-                self.device = "cpu"
-        log(f"IndicConformer loaded on {self.device}")
+            try: self.backend = self.backend.to(self.device)
+            except: self.device = "cpu"
 
-    # ── faster-whisper ────────────────────────────────────────────────────
-    def _load_faster_whisper(self, size):
-        has_cuda = False
-        try:
-            has_cuda = torch.cuda.is_available()
-        except Exception:
-            pass
-        device = "cuda" if has_cuda else "cpu"
-        compute = "float16" if has_cuda else "int8"
-        log(f"Loading faster-whisper: {size} on {device} ({compute})")
-        self.backend = _FWModel(size, device=device, compute_type=compute,
-                                cpu_threads=CPU_THR)
-        log(f"faster-whisper loaded: {size}")
+    def _load_fw(self, size):
+        has_cuda = _HF and torch.cuda.is_available() if _HF else False
+        self.backend = _FWModel(size,
+            device="cuda" if has_cuda else "cpu",
+            compute_type="float16" if has_cuda else "int8",
+            cpu_threads=CPU_THR)
 
-    # ── HF Whisper ────────────────────────────────────────────────────────
-    def _load_hf_whisper(self, model_id):
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        log(f"Loading HF Whisper: {model_id} on {device}")
+    def _load_hf(self, mid):
+        dev = "cuda:0" if torch.cuda.is_available() else "cpu"
+        dt = torch.float16 if torch.cuda.is_available() else torch.float32
         self.backend = AutoModelForSpeechSeq2Seq.from_pretrained(
-            model_id, torch_dtype=dtype,
-            low_cpu_mem_usage=True, use_safetensors=True,
-        ).to(device)
-        self.processor = AutoProcessor.from_pretrained(model_id)
-        self.device = device
-        log(f"HF Whisper loaded: {model_id}")
+            mid, torch_dtype=dt, low_cpu_mem_usage=True, use_safetensors=True).to(dev)
+        self.processor = AutoProcessor.from_pretrained(mid)
+        self.device = dev
 
-    # ── Transcribe ────────────────────────────────────────────────────────
     def transcribe(self, audio_16k, lang_iso, lang_name, mode="full"):
-        if self.backend is None or audio_16k is None or len(audio_16k) == 0:
-            return ""
-
-        # Pad short segments
-        min_samp = int(0.1 * SR16)
-        if len(audio_16k) < min_samp:
-            audio_16k = np.pad(audio_16k, (0, min_samp - len(audio_16k)))
+        if self.backend is None or audio_16k is None or len(audio_16k) == 0: return ""
+        min_s = int(0.1 * SR16)
+        if len(audio_16k) < min_s:
+            audio_16k = np.pad(audio_16k, (0, min_s - len(audio_16k)))
         audio_16k = audio_16k.astype(np.float32)
-
-        if self.engine_key == "indicconformer":
-            return self._tx_indicconformer(audio_16k, lang_iso, mode)
-        elif self.engine_key == "fw":
-            return self._tx_fw(audio_16k, lang_iso, mode)
-        elif self.engine_key == "hf_whisper":
-            return self._tx_hf(audio_16k, lang_name, mode)
+        if self.engine_key == "indicconformer": return self._tx_ic(audio_16k, lang_iso, mode)
+        elif self.engine_key == "fw": return self._tx_fw(audio_16k, lang_iso, mode)
+        elif self.engine_key == "hf_whisper": return self._tx_hf(audio_16k, lang_name, mode)
         return ""
 
-    def _tx_indicconformer(self, audio, lang_iso, mode):
-        """IndicConformer API: model(wav_tensor, lang_code, decode_type)"""
-        wav = torch.tensor(audio, dtype=torch.float32).unsqueeze(0)  # [1, N]
-        if self.device and self.device != "cpu":
-            wav = wav.to(self.device)
-
-        # Use CTC decoding (faster) — alternatives: "rnnt"
+    def _tx_ic(self, audio, lang_iso, mode):
+        wav = torch.tensor(audio, dtype=torch.float32).unsqueeze(0)
+        if self.device and self.device != "cpu": wav = wav.to(self.device)
         with torch.inference_mode():
             text = self.backend(wav, lang_iso, "ctc")
-
-        if isinstance(text, (list, tuple)):
-            text = text[0] if text else ""
+        if isinstance(text, (list, tuple)): text = text[0] if text else ""
         return clean_text(str(text), mode)
 
     def _tx_fw(self, audio, lang_iso, mode):
-        segments_gen, info = self.backend.transcribe(
-            audio, language=lang_iso, task="transcribe",
-            beam_size=1, best_of=1, vad_filter=False,
-            without_timestamps=True, condition_on_previous_text=False,
-        )
-        segments_list = list(segments_gen)  # MUST consume generator
-        text = " ".join(s.text.strip() for s in segments_list if s.text.strip())
+        seg_gen, _ = self.backend.transcribe(audio, language=lang_iso, task="transcribe",
+            beam_size=1, best_of=1, vad_filter=False, without_timestamps=True,
+            condition_on_previous_text=False)
+        text = " ".join(s.text.strip() for s in list(seg_gen) if s.text.strip())
         return clean_text(text, mode)
 
     def _tx_hf(self, audio, lang_name, mode):
-        inputs = self.processor(audio, sampling_rate=SR16,
-                                return_tensors="pt", return_attention_mask=True)
-        feat = inputs.input_features.to(self.device)
-        mask = getattr(inputs, "attention_mask", None)
+        inp = self.processor(audio, sampling_rate=SR16, return_tensors="pt", return_attention_mask=True)
+        feat = inp.input_features.to(self.device)
+        mask = getattr(inp, "attention_mask", None)
         if mask is not None: mask = mask.to(self.device)
-        gk = {"input_features": feat, "task": "transcribe",
-              "language": lang_name, "return_timestamps": False}
+        gk = {"input_features": feat, "task": "transcribe", "language": lang_name, "return_timestamps": False}
         if mask is not None: gk["attention_mask"] = mask
-        with torch.inference_mode():
-            ids = self.backend.generate(**gk)
-        text = self.processor.batch_decode(ids, skip_special_tokens=True)[0]
-        return clean_text(text, mode)
-
+        with torch.inference_mode(): ids = self.backend.generate(**gk)
+        return clean_text(self.processor.batch_decode(ids, skip_special_tokens=True)[0], mode)
 
 ENGINE = Engine()
 
@@ -440,34 +535,32 @@ class AudioLoadThread(QThread):
             y, sr = load_audio(self.path)
             y16 = resample_audio(y, sr, SR16)
             self.done.emit(y, sr, y16, self.path)
-        except Exception as e:
-            traceback.print_exc(); self.error.emit(str(e))
-
+        except Exception as e: traceback.print_exc(); self.error.emit(str(e))
 
 class ModelLoadThread(QThread):
     done = pyqtSignal(bool, str, float)
     error = pyqtSignal(str)
-    def __init__(self, engine_key, model_id):
-        super().__init__()
-        self.engine_key, self.model_id = engine_key, model_id
+    def __init__(self, ek, mid): super().__init__(); self.ek, self.mid = ek, mid
     def run(self):
         try:
-            ok, msg, elapsed = ENGINE.load(self.engine_key, self.model_id)
-            self.done.emit(ok, msg, elapsed)
-        except Exception as e:
-            traceback.print_exc(); self.error.emit(str(e))
+            ok, msg, el = ENGINE.load(self.ek, self.mid)
+            self.done.emit(ok, msg, el)
+        except Exception as e: traceback.print_exc(); self.error.emit(str(e))
 
 
 class PredictionThread(QThread):
-    seg_result = pyqtSignal(int, str, float)
+    """
+    Auto-mode prediction: classifies each segment and applies correct mode.
+    """
+    seg_result = pyqtSignal(int, str, float, str)  # idx, pred, acc, seg_type
     progress = pyqtSignal(int, int)
     done = pyqtSignal(list, float, float)
     error = pyqtSignal(str)
 
-    def __init__(self, y16, segments, lang_iso, lang_name, mode):
+    def __init__(self, y16, segments, lang_iso, lang_name):
         super().__init__()
         self.y16, self.segments = y16, segments
-        self.lang_iso, self.lang_name, self.mode = lang_iso, lang_name, mode
+        self.lang_iso, self.lang_name = lang_iso, lang_name
         self._stop = False
 
     def request_stop(self): self._stop = True
@@ -477,29 +570,54 @@ class PredictionThread(QThread):
             t0 = time.time()
             total = len(self.segments)
             results = []
-            log(f"Prediction: {total} segs, lang={self.lang_iso}, engine={ENGINE.engine_key}")
+            log(f"Auto-mode prediction: {total} segs, lang={self.lang_iso}")
 
             for i, seg in enumerate(self.segments):
-                if self._stop:
-                    log("Stopped by user"); break
+                if self._stop: log("Stopped"); break
 
+                # ── Auto-classify this segment ────────────────────────────
+                info = classify_segment(seg["label"])
+                seg_type = info["type"]       # "char" / "word" / "sentence" / "paragraph"
+                mode = info["mode"]           # "char" / "word" / "full"
+                compare_to = info["compare_to"]
+                is_seq = info["is_seq"]
+
+                # ── Transcribe ────────────────────────────────────────────
                 s = max(0, int(seg["start"] * SR16))
                 e = min(len(self.y16), int(seg["end"] * SR16))
                 chunk = self.y16[s:e]
 
-                pred = ENGINE.transcribe(chunk, self.lang_iso, self.lang_name, self.mode)
-                acc = accuracy(pred, seg["label"])
-                results.append({"i": i, "gt": seg["label"], "pred": pred,
-                                "start": seg["start"], "end": seg["end"], "acc": acc})
+                pred = ENGINE.transcribe(chunk, self.lang_iso, self.lang_name, mode)
 
-                self.seg_result.emit(i, pred, acc)
+                # ── Compute accuracy ──────────────────────────────────────
+                if is_seq and compare_to:
+                    # Sequence label WITH reference text → compare against txt file
+                    acc = accuracy(pred, compare_to)
+                elif is_seq and not compare_to:
+                    # Sequence label WITHOUT reference → no accuracy (show transcript only)
+                    acc = -1.0
+                else:
+                    # Regular label → compare against the label itself
+                    acc = accuracy(pred, seg["label"])
+
+                results.append({
+                    "i": i, "gt": seg["label"], "pred": pred,
+                    "start": seg["start"], "end": seg["end"],
+                    "acc": acc, "type": seg_type, "mode": mode,
+                    "is_seq": is_seq, "compare_to": compare_to or seg["label"],
+                })
+
+                self.seg_result.emit(i, pred, acc, seg_type)
                 self.progress.emit(i + 1, total)
 
+                acc_str = f"{acc:.3f}" if acc >= 0 else "N/A"
                 if (i + 1) % 5 == 0 or (i + 1) == total:
-                    log(f"  [{i+1}/{total}] GT='{seg['label']}' → PRED='{pred}' acc={acc:.3f}")
+                    log(f"  [{i+1}/{total}] [{seg_type:>9}] GT='{seg['label']}' "
+                        f"→ PRED='{pred[:40]}' acc={acc_str}")
 
             elapsed = time.time() - t0
-            mean_acc = np.mean([r["acc"] for r in results]) if results else 0.0
+            scored = [r["acc"] for r in results if r["acc"] >= 0]
+            mean_acc = np.mean(scored) if scored else 0.0
             self.done.emit(results, float(mean_acc), elapsed)
         except Exception as e:
             traceback.print_exc(); self.error.emit(str(e))
@@ -520,9 +638,8 @@ class VADThread(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Indic Speech Annotation Tool v3")
+        self.setWindowTitle("Indic Speech Annotation Tool — Auto Mode")
         self.resize(1700, 1000)
-
         self.audio_path = None
         self.y = self.y16 = self.wave_t = self.wave_y = None
         self.sr = None
@@ -531,7 +648,6 @@ class MainWindow(QMainWindow):
         self._threads = {}
         self._pred_t0 = None
         self._timer = None
-
         self._build_ui()
 
     def _build_ui(self):
@@ -543,15 +659,11 @@ class MainWindow(QMainWindow):
         self.cb_lang = QComboBox()
         for d, iso, name in LANGUAGES:
             self.cb_lang.addItem(d, (iso, name))
+        self.cb_lang.currentIndexChanged.connect(self._on_lang_changed)
 
         self.cb_model = QComboBox()
         for d, ek, mid, note in MODELS:
             self.cb_model.addItem(d, (ek, mid))
-        self.cb_model.setToolTip("★ IndicConformer outputs correct Gujarati/Hindi/Marathi script")
-
-        self.cb_mode = QComboBox()
-        for d, k in PRED_MODES:
-            self.cb_mode.addItem(d, k)
 
         self.btn_audio = QPushButton("Load Audio")
         self.btn_audio.clicked.connect(self.on_load_audio)
@@ -563,13 +675,29 @@ class MainWindow(QMainWindow):
             "QPushButton{font-weight:bold;color:white;background:#2563eb;"
             "border:1px solid #1d4ed8;padding:5px 14px;border-radius:4px}"
             "QPushButton:hover{background:#1d4ed8}"
-            "QPushButton:disabled{color:#9ca3af;background:#f3f4f6;border:1px solid #d1d5db;font-weight:normal}")
+            "QPushButton:disabled{color:#9ca3af;background:#f3f4f6;border:1px solid #d1d5db}")
+
+        # Auto-mode indicator (replaces the old mode dropdown)
+        self.lbl_auto = QLabel("🤖 Auto-Mode")
+        self.lbl_auto.setStyleSheet(
+            "padding:4px 10px;background:#dbeafe;border:1px solid #93c5fd;"
+            "border-radius:4px;font-weight:bold;color:#1e40af;font-size:12px")
+        self.lbl_auto.setToolTip(
+            "Auto-Mode: The tool automatically detects segment types:\n"
+            "• Single character (અ, आ) → First Character\n"
+            "• Single word (ગુજરાત) → First Word\n"
+            "• S1-S5 / Paragraph → Full Transcript (compared to txt file)\n"
+            "• Multi-word text → Full Transcript")
+
+        self.lbl_transcript = QLabel("")
+        self.lbl_transcript.setStyleSheet("color:#6b7280;font-size:11px")
 
         for w in [QLabel("Language:"), self.cb_lang,
                   QLabel("Model:"), self.cb_model,
-                  QLabel("Output:"), self.cb_mode,
+                  self.lbl_auto,
                   self.btn_audio, self.btn_gt, self.btn_model]:
             r1.addWidget(w)
+        r1.addWidget(self.lbl_transcript)
         r1.addStretch()
 
         # ── Row 2 ─────────────────────────────────────────────────────────
@@ -589,47 +717,40 @@ class MainWindow(QMainWindow):
         ]
         self._btns = {}
         for name, fn, style in actions:
-            b = QPushButton(name)
-            b.clicked.connect(fn)
+            b = QPushButton(name); b.clicked.connect(fn)
             if style: b.setStyleSheet(f"QPushButton{{{style}}}")
-            r2.addWidget(b)
-            self._btns[name] = b
+            r2.addWidget(b); self._btns[name] = b
         self._btns["⏹ Stop"].setEnabled(False)
         r2.addStretch()
 
         # ── Status ────────────────────────────────────────────────────────
-        sr = QHBoxLayout()
-        self.lbl_status = QLabel("Step 1: Select model & click 'Load Model'")
+        sr_row = QHBoxLayout()
+        self.lbl_status = QLabel("Step 1: Select language → Step 2: Load Model")
         self.lbl_status.setStyleSheet("padding:4px;font-size:13px")
         self.lbl_speed = QLabel("")
         self.lbl_speed.setStyleSheet("color:#6b7280;font-size:12px")
-        sr.addWidget(self.lbl_status, 1); sr.addWidget(self.lbl_speed)
+        sr_row.addWidget(self.lbl_status, 1); sr_row.addWidget(self.lbl_speed)
 
         self.pbar = QProgressBar()
-        self.pbar.setRange(0, 100); self.pbar.setValue(0); self.pbar.setFixedHeight(18)
+        self.pbar.setRange(0,100); self.pbar.setValue(0); self.pbar.setFixedHeight(18)
         self.pbar.setStyleSheet(
             "QProgressBar{border:1px solid #ccc;border-radius:4px;background:#f3f4f6;"
             "text-align:center;font-size:11px}"
             "QProgressBar::chunk{background:#3b82f6;border-radius:4px}")
 
-        # ── Canvas (dual panel: main waveform + overview minimap) ─────────
-        self.fig = plt.figure(figsize=(14, 6))
-        gs = self.fig.add_gridspec(2, 1, height_ratios=[4, 1], hspace=0.08)
-        self.ax = self.fig.add_subplot(gs[0])      # main waveform
-        self.ax_mini = self.fig.add_subplot(gs[1])  # overview minimap
-        self.fig.set_tight_layout(False)
-        self.fig.subplots_adjust(left=0.06, right=0.98, top=0.94, bottom=0.06)
+        # ── Canvas ────────────────────────────────────────────────────────
+        self.fig, self.ax = plt.subplots(figsize=(14, 5))
+        self.fig.set_tight_layout(True)
         self.canvas = FigureCanvas(self.fig)
         self.toolbar = NavigationToolbar(self.canvas, self)
         self.canvas.mpl_connect("scroll_event", self._on_scroll)
-        self._view_box = None  # rectangle on minimap showing current view
 
         # ── Right panel ───────────────────────────────────────────────────
         self.seg_list = QListWidget()
         self.seg_list.itemClicked.connect(self.on_seg_clicked)
         self.seg_list.setStyleSheet(
             "QListWidget{background:#fff;border:1px solid #d0d0d0;"
-            "font-family:Consolas,Courier New,monospace;font-size:12px}"
+            "font-family:Consolas,Courier New,monospace;font-size:11px}"
             "QListWidget::item{padding:3px 6px}"
             "QListWidget::item:selected{background:#dbeafe}")
 
@@ -644,43 +765,46 @@ class MainWindow(QMainWindow):
             h = QHBoxLayout(); h.addWidget(QLabel(lbl)); h.addWidget(w); vl.addLayout(h)
         vl.addStretch()
 
-        # Model info tab
-        info_box = QGroupBox("Model Guide")
-        il = QVBoxLayout(info_box)
-        info = QLabel(
-            "<b>★ Recommended for Gujarati/Hindi/Marathi:</b><br>"
-            "<span style='color:#16a34a'>AI4Bharat IndicConformer-600M</span><br>"
-            "• Trained on all 22 Indian languages<br>"
-            "• Outputs <b>correct script</b> (ગુજરાતી, हिन्दी, मराठी)<br>"
-            "• Uses CTC decoding (fast)<br><br>"
-            "<b>Why Whisper gives wrong script:</b><br>"
-            "• Whisper small/medium confuse Gujarati → Hindi<br>"
-            "• Even large-v3 may mix Devanagari & Gujarati<br>"
-            "• Whisper is not fine-tuned for Indian languages<br><br>"
-            "<b>Available Indic ASR Models:</b><br>"
-            "1. <b>IndicConformer-600M</b> — AI4Bharat (best)<br>"
-            "2. <b>IndicWhisper</b> — fine-tuned Whisper<br>"
-            "3. <b>Meta MMS-1B</b> — 1000+ languages<br>"
-            "4. <b>Whisper large-v3</b> — generic multilingual<br>"
+        # Transcript info tab
+        tx_box = QGroupBox("Transcript Files")
+        tl = QVBoxLayout(tx_box)
+        self.lbl_tx_info = QLabel(
+            f"<b>Transcript folder:</b><br><code>{TRANSCRIPTS_DIR}</code><br><br>"
+            "<b>How to use:</b><br>"
+            "1. Create a .txt file for each language:<br>"
+            "   <code>transcripts/gu.txt</code>, <code>hi.txt</code>, <code>mr.txt</code>, etc.<br><br>"
+            "2. Format:<br>"
+            "<code>[S1]<br>Expected sentence text<br>[S2]<br>Another sentence<br>"
+            "[Paragraph]<br>Full paragraph text</code><br><br>"
+            "3. When you select a language, the tool auto-loads the matching file.<br><br>"
+            "<b>Auto-Mode classification:</b><br>"
+            "• <span style='color:#7c3aed'>Ⓒ</span> Single char (અ, आ) → character mode<br>"
+            "• <span style='color:#0284c7'>Ⓦ</span> Single word (ગુજરાત) → word mode<br>"
+            "• <span style='color:#16a34a'>Ⓢ</span> S1-S5 → full transcript, compared to txt<br>"
+            "• <span style='color:#ea580c'>Ⓟ</span> Paragraph → full transcript, compared to txt<br>"
+            "• <span style='color:#374151'>Ⓕ</span> Multi-word → full transcript mode"
         )
-        info.setTextFormat(Qt.RichText)
-        info.setWordWrap(True)
-        info.setStyleSheet("font-size:11px;color:#374151")
-        il.addWidget(info); il.addStretch()
+        self.lbl_tx_info.setTextFormat(Qt.RichText)
+        self.lbl_tx_info.setWordWrap(True)
+        self.lbl_tx_info.setStyleSheet("font-size:11px")
+        tl.addWidget(self.lbl_tx_info); tl.addStretch()
 
         tabs = QTabWidget()
         seg_tab = QWidget(); sl = QVBoxLayout(seg_tab)
         legend = QLabel(
-            '<span style="color:green;font-weight:bold">■ GT</span>  '
-            '<span style="color:blue;font-weight:bold">■ PRED</span>  | '
-            '<span style="color:#16a34a">✓≥95%</span>  '
-            '<span style="color:#ea580c">~50-95%</span>  '
-            '<span style="color:#dc2626">✗&lt;50%</span>')
+            '<span style="color:#7c3aed;font-weight:bold">Ⓒ Char</span>  '
+            '<span style="color:#0284c7;font-weight:bold">Ⓦ Word</span>  '
+            '<span style="color:#16a34a;font-weight:bold">Ⓢ Sentence</span>  '
+            '<span style="color:#ea580c;font-weight:bold">Ⓟ Paragraph</span>  |  '
+            '<span style="color:#16a34a">✓≥95%</span> '
+            '<span style="color:#d97706">~50-95%</span> '
+            '<span style="color:#dc2626">✗&lt;50%</span> '
+            '<span style="color:#6366f1">📝no-ref</span>')
         legend.setTextFormat(Qt.RichText)
         sl.addWidget(legend); sl.addWidget(self.seg_list)
         tabs.addTab(seg_tab, "Segments")
         tabs.addTab(vad_box, "VAD")
-        tabs.addTab(info_box, "Model Guide")
+        tabs.addTab(tx_box, "Transcripts")
 
         left = QWidget(); ll = QVBoxLayout(left)
         ll.addWidget(self.toolbar); ll.addWidget(self.canvas)
@@ -690,45 +814,41 @@ class MainWindow(QMainWindow):
         splitter.setSizes([1250, 400])
 
         L.addLayout(r1); L.addLayout(r2)
-        L.addLayout(sr); L.addWidget(self.pbar); L.addWidget(splitter)
+        L.addLayout(sr_row); L.addWidget(self.pbar); L.addWidget(splitter)
+
+        # Load transcript for default language
+        self._on_lang_changed()
 
     # ── Helpers ───────────────────────────────────────────────────────────
     def _set_busy(self, busy, msg=""):
         en = not busy
         for n, b in self._btns.items():
             b.setEnabled(busy if n == "⏹ Stop" else en)
-        for w in [self.btn_audio, self.btn_gt, self.btn_model,
-                  self.cb_lang, self.cb_model, self.cb_mode]:
+        for w in [self.btn_audio, self.btn_gt, self.btn_model, self.cb_lang, self.cb_model]:
             w.setEnabled(en)
         if msg: self.lbl_status.setText(msg)
 
     def _build_wave(self):
-        if self.y is None:
-            self.wave_t = self.wave_y = self.wave_env = None
-            return
-        n = len(self.y)
-        # Downsampled waveform for fast plotting
-        max_pts = 30000
-        step = max(1, n // max_pts)
+        if self.y is None: self.wave_t = self.wave_y = None; return
+        step = max(1, len(self.y) // 30000)
         self.wave_y = self.y[::step]
         self.wave_t = np.arange(len(self.wave_y)) * (step / self.sr)
 
-        # RMS envelope (for overview when zoomed out)
-        env_hop = max(1, n // 2000)  # ~2000 points for envelope
-        n_env = n // env_hop
-        if n_env > 0:
-            trimmed = self.y[:n_env * env_hop].reshape(n_env, env_hop)
-            self.wave_env_pos = np.sqrt(np.mean(trimmed ** 2, axis=1))
-            self.wave_env_neg = -self.wave_env_pos
-            self.wave_env_t = (np.arange(n_env) + 0.5) * env_hop / self.sr
-        else:
-            self.wave_env_pos = self.wave_env_neg = self.wave_env_t = None
-
-        self.audio_duration = n / self.sr
-        log(f"Wave cache: {len(self.wave_y)} pts, envelope: {n_env} pts, duration: {self.audio_duration:.1f}s")
-
     def _play(self, y, sr):
         if y is not None and sr: sd.stop(); sd.play(y, sr)
+
+    # ── Language changed → load transcript ────────────────────────────────
+    def _on_lang_changed(self):
+        iso, name = self.cb_lang.currentData()
+        ok, msg = TRANSCRIPTS.load(iso)
+        if ok:
+            secs = ", ".join(TRANSCRIPTS.sections)
+            self.lbl_transcript.setText(f"📄 {iso}.txt: {secs}")
+            self.lbl_transcript.setStyleSheet("color:#16a34a;font-size:11px;font-weight:bold")
+        else:
+            self.lbl_transcript.setText(f"⚠ No {iso}.txt (S1-S5 won't have reference)")
+            self.lbl_transcript.setStyleSheet("color:#d97706;font-size:11px")
+        log(f"Language: {name} | Transcript: {msg}")
 
     # ── Load Audio ────────────────────────────────────────────────────────
     def on_load_audio(self):
@@ -745,13 +865,12 @@ class MainWindow(QMainWindow):
         self.y, self.sr, self.y16, self.audio_path = y, sr, y16, path
         self.results = []; self.selected_idx = None; self.pbar.setValue(0)
         self._build_wave()
-        self.lbl_status.setText(f"Audio: {os.path.basename(path)} ({len(y)/sr:.1f}s, sr={sr})")
+        self.lbl_status.setText(f"Audio: {os.path.basename(path)} ({len(y)/sr:.1f}s)")
         self.btn_audio.setEnabled(True)
         self._refresh_list(); self._redraw()
 
     def _audio_err(self, msg):
-        self.btn_audio.setEnabled(True)
-        QMessageBox.critical(self, "Error", msg)
+        self.btn_audio.setEnabled(True); QMessageBox.critical(self, "Error", msg)
 
     # ── Load GT ───────────────────────────────────────────────────────────
     def on_load_gt(self):
@@ -769,8 +888,17 @@ class MainWindow(QMainWindow):
                 if not lab or s is None or e is None or e <= s: skip += 1; continue
                 segs.append({"label": lab, "start": s, "end": e})
             self.segments = segs; self.results = []; self.selected_idx = None
-            self.lbl_status.setText(f"GT: {len(segs)} segments" +
-                                    (f" ({skip} skipped)" if skip else ""))
+
+            # Count segment types
+            types = {"char": 0, "word": 0, "sentence": 0, "paragraph": 0}
+            for seg in segs:
+                info = classify_segment(seg["label"])
+                types[info["type"]] += 1
+
+            type_str = "  |  ".join(f"{k}: {v}" for k, v in types.items() if v > 0)
+            self.lbl_status.setText(
+                f"GT: {len(segs)} segments ({type_str})"
+                + (f"  |  skipped {skip}" if skip else ""))
             self._refresh_list(); self._redraw()
         except Exception as e:
             traceback.print_exc(); QMessageBox.critical(self, "Error", str(e))
@@ -779,22 +907,15 @@ class MainWindow(QMainWindow):
     def on_load_model(self):
         t = self._threads.get("model")
         if t and t.isRunning():
-            QMessageBox.information(self, "Loading",
-                "Model is still downloading. Please wait.\n"
-                "Check the status bar for progress.")
-            return
-
+            QMessageBox.information(self, "Loading", "Model is still downloading."); return
         ek, mid = self.cb_model.currentData()
         self._set_busy(True, f"Loading {mid}...")
-        self.btn_model.setText("Loading...")
-        self.btn_model.setEnabled(False)
-
+        self.btn_model.setText("Loading..."); self.btn_model.setEnabled(False)
         self._load_t0 = time.time()
         self._timer = QTimer()
         self._timer.timeout.connect(lambda: self.lbl_status.setText(
-            f"Loading model... {int(time.time()-self._load_t0)}s elapsed"))
+            f"Loading model... {int(time.time()-self._load_t0)}s"))
         self._timer.start(1000)
-
         t = ModelLoadThread(ek, mid)
         t.done.connect(self._model_ok); t.error.connect(self._model_err)
         self._threads["model"] = t; t.start()
@@ -802,26 +923,17 @@ class MainWindow(QMainWindow):
     def _stop_timer(self):
         if self._timer: self._timer.stop(); self._timer = None
 
-    def _model_ok(self, ok, msg, elapsed):
-        self._stop_timer()
-        self._set_busy(False)
-        self.btn_model.setEnabled(True)
+    def _model_ok(self, ok, msg, el):
+        self._stop_timer(); self._set_busy(False); self.btn_model.setEnabled(True)
         if ok:
             self.btn_model.setText("✓ Model Loaded")
             self.btn_model.setStyleSheet(
                 "QPushButton{font-weight:bold;color:white;background:#16a34a;"
-                "border:1px solid #15803d;padding:5px 14px;border-radius:4px}"
-                "QPushButton:hover{background:#15803d}")
-            self.lbl_status.setText(f"✓ {msg}")
-            self.lbl_speed.setText(f"Engine: {ENGINE.engine_key}")
+                "border:1px solid #15803d;padding:5px 14px;border-radius:4px}")
+            self.lbl_status.setText(f"✓ {msg}"); self.lbl_speed.setText(f"Engine: {ENGINE.engine_key}")
         else:
             self.btn_model.setText("⬇ Load Model")
-            self.lbl_status.setText(f"✗ Failed: {msg}")
-            QMessageBox.critical(self, "Error",
-                f"Failed to load model:\n\n{msg}\n\n"
-                "• Check internet (first-time download)\n"
-                "• Try a smaller model\n"
-                "• Check terminal for details")
+            QMessageBox.critical(self, "Error", f"Failed:\n{msg}")
 
     def _model_err(self, msg):
         self._stop_timer(); self._set_busy(False)
@@ -846,33 +958,45 @@ class MainWindow(QMainWindow):
         self._set_busy(False, f"VAD: {len(segs)} segments")
         self._refresh_list(); self._redraw()
 
-    # ── Run Prediction ────────────────────────────────────────────────────
+    # ── Run Prediction (AUTO MODE) ────────────────────────────────────────
     def on_run(self):
         if self.y16 is None: QMessageBox.warning(self, "", "Load audio."); return
-        if not self.segments: QMessageBox.warning(self, "", "Load GT or run VAD."); return
+        if not self.segments: QMessageBox.warning(self, "", "Load GT or VAD."); return
         if not ENGINE.is_loaded: QMessageBox.warning(self, "", "Load model first."); return
         t = self._threads.get("pred")
         if t and t.isRunning(): return
 
         iso, name = self.cb_lang.currentData()
-        mode = self.cb_mode.currentData()
         self.results = []; self.pbar.setValue(0); self._pred_t0 = time.time()
-        self._set_busy(True, "Running prediction...")
+        self._set_busy(True, "Running auto-mode prediction...")
         self._refresh_list()
 
-        t = PredictionThread(self.y16, self.segments, iso, name, mode)
+        # NO manual mode — PredictionThread auto-classifies each segment
+        t = PredictionThread(self.y16, self.segments, iso, name)
         t.seg_result.connect(self._on_seg_result)
         t.progress.connect(self._on_pred_prog)
         t.done.connect(self._on_pred_done)
         t.error.connect(self._on_pred_err)
         self._threads["pred"] = t; t.start()
 
-    def _on_seg_result(self, idx, pred, acc):
-        if idx < self.seg_list.count():
-            seg = self.segments[idx]
-            item = self.seg_list.item(idx)
-            item.setText(f"{idx+1:03d} │ GT: {seg['label']}  →  PRED: {pred or '—'}"
-                        f"  │ {seg['start']:.2f}-{seg['end']:.2f}s  acc={acc:.2f}")
+    def _on_seg_result(self, idx, pred, acc, seg_type):
+        if idx >= self.seg_list.count(): return
+        seg = self.segments[idx]
+        item = self.seg_list.item(idx)
+
+        # Type icon
+        icons = {"char": "Ⓒ", "word": "Ⓦ", "sentence": "Ⓢ", "paragraph": "Ⓟ"}
+        icon = icons.get(seg_type, "?")
+
+        if acc < 0:
+            # No reference text → just show transcript
+            ps = (pred[:45] + "…") if len(pred) > 45 else pred
+            item.setText(f"{idx+1:03d} {icon} {seg['label']}  →  {ps}  │ {seg['start']:.2f}-{seg['end']:.2f}s  [no-ref]")
+            from PyQt5.QtGui import QColor
+            item.setForeground(QColor("#6366f1"))  # indigo
+        else:
+            ps = (pred[:35] + "…") if len(pred) > 35 else pred
+            item.setText(f"{idx+1:03d} {icon} {seg['label']}  →  {ps}  │ {seg['start']:.2f}-{seg['end']:.2f}s  acc={acc:.2f}")
             if acc >= 0.95: item.setForeground(Qt.darkGreen)
             elif acc >= 0.5: item.setForeground(Qt.darkYellow)
             else: item.setForeground(Qt.red)
@@ -880,18 +1004,32 @@ class MainWindow(QMainWindow):
     def _on_pred_prog(self, done, total):
         pct = int(done / total * 100) if total else 0
         self.pbar.setValue(pct)
-        elapsed = time.time() - self._pred_t0
-        spd = done / elapsed if elapsed > 0 else 0
+        el = time.time() - self._pred_t0
+        spd = done / el if el > 0 else 0
         eta = (total - done) / spd if spd > 0 else 0
         self.lbl_status.setText(f"Predicting {done}/{total} ({spd:.1f} seg/s, ETA {eta:.0f}s)")
 
     def _on_pred_done(self, results, mean_acc, elapsed):
-        self.results = results
-        self.pbar.setValue(100)
+        self.results = results; self.pbar.setValue(100)
         n = len(results)
+        n_scored = sum(1 for r in results if r["acc"] >= 0)
+        n_good = sum(1 for r in results if r["acc"] >= 0.95)
+        n_noref = sum(1 for r in results if r["acc"] < 0)
         spd = n / elapsed if elapsed > 0 else 0
-        self._set_busy(False,
-            f"✓ Done: {n} segs in {elapsed:.1f}s | Accuracy: {mean_acc:.3f} | {spd:.1f} seg/s")
+
+        # Count by type
+        types = {}
+        for r in results:
+            types[r["type"]] = types.get(r["type"], 0) + 1
+
+        type_str = "  ".join(f"{k}:{v}" for k, v in types.items())
+        parts = [f"✓ {n} segs in {elapsed:.1f}s"]
+        if n_scored: parts.append(f"Acc: {mean_acc:.3f} ({n_good}/{n_scored} ≥95%)")
+        if n_noref: parts.append(f"📝 {n_noref} no-ref")
+        parts.append(type_str)
+        parts.append(f"{spd:.1f} seg/s")
+
+        self._set_busy(False, " | ".join(parts))
         self.lbl_speed.setText(f"{spd:.1f} seg/s")
         self._refresh_list(); self._redraw()
 
@@ -904,199 +1042,117 @@ class MainWindow(QMainWindow):
         if t and t.isRunning(): t.request_stop()
 
     # ── Plot ──────────────────────────────────────────────────────────────
-    @staticmethod
-    def _fmt_time(seconds):
-        """Format seconds as mm:ss or hh:mm:ss."""
-        s = int(seconds)
-        if s >= 3600:
-            return f"{s//3600}:{(s%3600)//60:02d}:{s%60:02d}"
-        return f"{s//60}:{s%60:02d}"
-
-    def _fit_segments(self):
-        """Auto-zoom to the region containing all segments."""
-        if not self.segments or self.y is None:
-            self._reset_view(); return
-        s_min = min(seg["start"] for seg in self.segments)
-        s_max = max(seg["end"] for seg in self.segments)
-        pad = max(1.0, (s_max - s_min) * 0.05)
-        self._redraw(xlim=(max(0, s_min - pad), s_max + pad))
-
     def _redraw(self, xlim=None):
-        """Redraw waveform + minimap. Pass xlim=(x0,x1) for zoom."""
         self.ax.clear()
-        self.ax_mini.clear()
-
-        if self.wave_t is None:
-            self.canvas.draw_idle(); return
-
-        dur = getattr(self, 'audio_duration', len(self.y) / self.sr) if self.y is not None else 1.0
+        if self.wave_t is None: self.canvas.draw_idle(); return
+        self.ax.plot(self.wave_t, self.wave_y, lw=0.5, color="#1e293b")
+        ymax = max(np.max(np.abs(self.wave_y)), 1e-6)
         iso, _ = self.cb_lang.currentData()
         fp = get_font(iso)
 
-        # ── Determine view range ─────────────────────────────────────────
         if xlim is None:
-            # Default: fit to segments if available, else full audio
             if self.segments:
-                s_min = min(seg["start"] for seg in self.segments)
-                s_max = max(seg["end"] for seg in self.segments)
+                s_min = min(s["start"] for s in self.segments)
+                s_max = max(s["end"] for s in self.segments)
                 pad = max(1.0, (s_max - s_min) * 0.05)
                 xlim = (max(0, s_min - pad), s_max + pad)
-            else:
-                xlim = (0, dur)
+            elif self.y is not None:
+                xlim = (0, len(self.y) / self.sr)
 
-        x0, x1 = xlim
-        view_span = x1 - x0
+        if xlim: self.ax.set_xlim(*xlim)
+        x0, x1 = self.ax.get_xlim()
 
-        # ── Main waveform ────────────────────────────────────────────────
-        # Use envelope when zoomed out (>30s visible), raw waveform when zoomed in
-        if view_span > 30 and self.wave_env_t is not None:
-            # Envelope (filled area)
-            mask = (self.wave_env_t >= x0) & (self.wave_env_t <= x1)
-            t_vis = self.wave_env_t[mask]
-            pos_vis = self.wave_env_pos[mask]
-            neg_vis = self.wave_env_neg[mask]
-            if len(t_vis) > 0:
-                self.ax.fill_between(t_vis, neg_vis, pos_vis,
-                                     color="#3b82f6", alpha=0.4, linewidth=0)
-                self.ax.plot(t_vis, pos_vis, lw=0.5, color="#1d4ed8", alpha=0.7)
-                self.ax.plot(t_vis, neg_vis, lw=0.5, color="#1d4ed8", alpha=0.7)
-        else:
-            # Raw waveform (zoomed in)
-            mask = (self.wave_t >= x0 - 1) & (self.wave_t <= x1 + 1)
-            t_vis = self.wave_t[mask]
-            y_vis = self.wave_y[mask]
-            if len(t_vis) > 0:
-                self.ax.plot(t_vis, y_vis, lw=0.6, color="#1e293b")
+        # Type colors
+        type_colors = {
+            "char":      ("#ede9fe", "#7c3aed"),  # purple
+            "word":      ("#e0f2fe", "#0284c7"),  # blue
+            "sentence":  ("#dcfce7", "#16a34a"),  # green
+            "paragraph": ("#fff7ed", "#ea580c"),  # orange
+        }
 
-        ymax = 1.05  # fixed amplitude scale
-
-        # ── Draw segments ────────────────────────────────────────────────
         for i, seg in enumerate(self.segments):
             s, e = seg["start"], seg["end"]
             if e < x0 or s > x1: continue
 
-            # Color based on accuracy
+            # Determine type and colors
             if self.results and i < len(self.results):
-                a = self.results[i]["acc"]
-                if a >= 0.95:
-                    clr, bar_clr = "#dcfce7", "#16a34a"
-                elif a >= 0.5:
-                    clr, bar_clr = "#fef3c7", "#d97706"
+                r = self.results[i]
+                seg_type = r.get("type", "word")
+                acc = r["acc"]
+                if acc < 0:
+                    clr, bar = "#e0e7ff", "#6366f1"  # indigo for no-ref
+                elif acc >= 0.95:
+                    clr, bar = type_colors.get(seg_type, ("#e0f2fe", "#0284c7"))
+                elif acc >= 0.5:
+                    clr, bar = "#fef3c7", "#d97706"
                 else:
-                    clr, bar_clr = "#fecaca", "#dc2626"
+                    clr, bar = "#fecaca", "#dc2626"
             else:
-                clr, bar_clr = "#e0f2fe", "#0284c7"
+                info = classify_segment(seg["label"])
+                clr, bar = type_colors.get(info["type"], ("#e0f2fe", "#0284c7"))
 
-            # Segment background
-            self.ax.axvspan(s, e, alpha=0.25, color=clr, zorder=1)
-            # Bottom bar (always visible even when zoomed out)
-            self.ax.plot([s, e], [-ymax*0.92, -ymax*0.92], lw=4,
-                        color=bar_clr, solid_capstyle="butt", zorder=3)
-            # Tick marks at segment boundaries
-            self.ax.axvline(s, lw=0.5, color=bar_clr, alpha=0.4, zorder=2)
+            self.ax.axvspan(s, e, alpha=0.2, color=clr, zorder=1)
+            self.ax.plot([s, e], [-ymax*0.92, -ymax*0.92], lw=3, color=bar,
+                        solid_capstyle="butt", zorder=3)
 
-            # Selected segment highlight
             if self.selected_idx is not None and i == self.selected_idx:
                 self.ax.axvspan(s, e, alpha=0.15, color="#facc15", zorder=2)
                 mid = (s + e) / 2
                 fkw = {"fontproperties": fp} if fp else {}
                 bbox = dict(facecolor="white", alpha=0.9, edgecolor="#d1d5db",
                            boxstyle="round,pad=0.3")
-                self.ax.text(mid, ymax*0.88, f"GT: {seg['label']}",
-                    ha="center", va="bottom", fontsize=10, color="#15803d",
-                    fontweight="bold", bbox=bbox, zorder=5, **fkw)
+                self.ax.text(mid, ymax*0.9, f"GT: {seg['label']}", ha="center",
+                    va="bottom", fontsize=10, color="#15803d", fontweight="bold",
+                    bbox=bbox, zorder=5, **fkw)
                 if self.results and i < len(self.results):
                     r = self.results[i]
-                    self.ax.text(mid, ymax*0.65,
-                        f"PRED: {r['pred'] or '∅'}  (acc={r['acc']:.2f})",
-                        ha="center", va="bottom", fontsize=10, color="#1d4ed8",
+                    p = (r['pred'][:50] + "…") if len(r['pred']) > 50 else r['pred']
+                    acc_s = f"acc={r['acc']:.2f}" if r['acc'] >= 0 else "no-ref"
+                    self.ax.text(mid, ymax*0.65, f"PRED: {p or '∅'} ({acc_s})",
+                        ha="center", va="bottom", fontsize=9, color="#1d4ed8",
                         fontweight="bold", bbox=bbox, zorder=5, **fkw)
 
-            # Show segment labels when zoomed in enough
-            elif view_span < 15 and (e - s) > view_span * 0.02:
-                mid = (s + e) / 2
-                fkw = {"fontproperties": fp} if fp else {}
-                label = seg["label"]
-                if len(label) > 8:
-                    label = label[:7] + "…"
-                self.ax.text(mid, ymax*0.85, label, ha="center", va="bottom",
-                            fontsize=8, color="#374151", alpha=0.8, zorder=4, **fkw)
-
-        # ── Axis formatting ──────────────────────────────────────────────
         title = "Waveform"
         if self.results:
-            mean_acc = np.mean([r["acc"] for r in self.results])
-            n_good = sum(1 for r in self.results if r["acc"] >= 0.95)
-            title += f"  │  Accuracy: {mean_acc:.3f}  │  {n_good}/{len(self.results)} correct (≥95%)"
-
-        self.ax.set_title(title, fontsize=11, fontweight="bold", pad=8)
-        self.ax.set_ylabel("Amplitude", fontsize=9)
-        self.ax.set_ylim(-ymax, ymax)
-        self.ax.set_xlim(x0, x1)
+            scored = [r["acc"] for r in self.results if r["acc"] >= 0]
+            if scored:
+                title += f"  │  Accuracy: {np.mean(scored):.3f}"
+                n_good = sum(1 for a in scored if a >= 0.95)
+                title += f"  │  {n_good}/{len(scored)} correct"
+        self.ax.set_title(title, fontsize=11, fontweight="bold")
+        self.ax.set_xlabel("Time (s)"); self.ax.set_ylabel("Amplitude")
+        self.ax.set_ylim(-ymax*1.05, ymax*1.05)
         self.ax.grid(axis="x", alpha=0.15, linestyle="--")
-
-        # Time axis formatting (mm:ss for long audio)
-        if view_span > 120:
-            from matplotlib.ticker import FuncFormatter
-            self.ax.xaxis.set_major_formatter(FuncFormatter(
-                lambda val, pos: self._fmt_time(val)))
-            self.ax.set_xlabel("Time (mm:ss)", fontsize=9)
-        else:
-            self.ax.set_xlabel("Time (seconds)", fontsize=9)
-
-        # ── Minimap (overview) ───────────────────────────────────────────
-        if self.wave_env_t is not None and len(self.wave_env_t) > 0:
-            self.ax_mini.fill_between(self.wave_env_t,
-                                      self.wave_env_neg, self.wave_env_pos,
-                                      color="#94a3b8", alpha=0.5, linewidth=0)
-        else:
-            self.ax_mini.plot(self.wave_t, self.wave_y, lw=0.3, color="#94a3b8")
-
-        # Segment markers on minimap
-        for i, seg in enumerate(self.segments):
-            s, e = seg["start"], seg["end"]
-            clr = "#16a34a"
-            if self.results and i < len(self.results):
-                a = self.results[i]["acc"]
-                clr = "#16a34a" if a >= 0.95 else ("#d97706" if a >= 0.5 else "#dc2626")
-            self.ax_mini.axvspan(s, e, alpha=0.3, color=clr)
-
-        # View rectangle on minimap
-        rect_y = self.ax_mini.get_ylim()
-        from matplotlib.patches import Rectangle
-        ry0, ry1 = rect_y
-        self.ax_mini.add_patch(Rectangle(
-            (x0, ry0), x1 - x0, ry1 - ry0,
-            linewidth=2, edgecolor="#2563eb", facecolor="#dbeafe",
-            alpha=0.3, zorder=10))
-
-        self.ax_mini.set_xlim(0, dur)
-        self.ax_mini.set_yticks([])
-        self.ax_mini.set_xlabel("")
-        self.ax_mini.tick_params(axis="x", labelsize=7)
-
-        # Time formatting on minimap too
-        if dur > 120:
-            from matplotlib.ticker import FuncFormatter
-            self.ax_mini.xaxis.set_major_formatter(FuncFormatter(
-                lambda val, pos: self._fmt_time(val)))
-
+        if xlim: self.ax.set_xlim(*xlim)
         self.canvas.draw_idle()
 
     # ── Segment List ──────────────────────────────────────────────────────
     def _refresh_list(self):
         self.seg_list.clear()
+        icons = {"char": "Ⓒ", "word": "Ⓦ", "sentence": "Ⓢ", "paragraph": "Ⓟ"}
+
         for i, seg in enumerate(self.segments):
+            info = classify_segment(seg["label"])
+            icon = icons.get(info["type"], "?")
+
             if self.results and i < len(self.results):
                 r = self.results[i]
-                text = (f"{i+1:03d} │ GT: {seg['label']}  →  PRED: {r['pred'] or '—'}"
-                       f"  │ {seg['start']:.2f}-{seg['end']:.2f}s  acc={r['acc']:.2f}")
-                item = QListWidgetItem(text)
-                if r["acc"] >= 0.95: item.setForeground(Qt.darkGreen)
-                elif r["acc"] >= 0.5: item.setForeground(Qt.darkYellow)
-                else: item.setForeground(Qt.red)
+                acc = r["acc"]
+                ps = (r['pred'][:35] + "…") if len(r['pred']) > 35 else r['pred']
+
+                if acc < 0:
+                    text = f"{i+1:03d} {icon} {seg['label']}  →  {ps}  │ {seg['start']:.2f}-{seg['end']:.2f}s  [no-ref]"
+                    item = QListWidgetItem(text)
+                    from PyQt5.QtGui import QColor
+                    item.setForeground(QColor("#6366f1"))
+                else:
+                    text = f"{i+1:03d} {icon} {seg['label']}  →  {ps}  │ {seg['start']:.2f}-{seg['end']:.2f}s  acc={acc:.2f}"
+                    item = QListWidgetItem(text)
+                    if acc >= 0.95: item.setForeground(Qt.darkGreen)
+                    elif acc >= 0.5: item.setForeground(Qt.darkYellow)
+                    else: item.setForeground(Qt.red)
             else:
-                text = f"{i+1:03d} │ GT: {seg['label']}  →  PRED: ...  │ {seg['start']:.2f}-{seg['end']:.2f}s"
+                text = f"{i+1:03d} {icon} {seg['label']}  →  ...  │ {seg['start']:.2f}-{seg['end']:.2f}s"
                 item = QListWidgetItem(text)
             self.seg_list.addItem(item)
 
@@ -1105,38 +1161,32 @@ class MainWindow(QMainWindow):
         if 0 <= self.selected_idx < len(self.segments):
             seg = self.segments[self.selected_idx]
             pad = max(0.3, (seg["end"] - seg["start"]) * 0.3)
-            x0 = max(0, seg["start"] - pad)
-            x1 = seg["end"] + pad
-            self._redraw(xlim=(x0, x1))
+            self._redraw(xlim=(max(0, seg["start"] - pad), seg["end"] + pad))
 
     def on_play_seg(self):
         if self.selected_idx is not None and self.y is not None:
             seg = self.segments[self.selected_idx]
-            sd.stop()
-            sd.play(self.y[int(seg["start"]*self.sr):int(seg["end"]*self.sr)], self.sr)
+            sd.stop(); sd.play(self.y[int(seg["start"]*self.sr):int(seg["end"]*self.sr)], self.sr)
 
     # ── Zoom ──────────────────────────────────────────────────────────────
     def _zoom(self, f):
         if self.y is None: return
         x0, x1 = self.ax.get_xlim(); c = (x0+x1)/2; w = (x1-x0)*f/2
-        tot = len(self.y)/self.sr
-        new_x0 = max(0, c-w)
-        new_x1 = min(tot, c+w)
-        self._redraw(xlim=(new_x0, new_x1))
+        self._redraw(xlim=(max(0, c-w), min(len(self.y)/self.sr, c+w)))
 
     def _on_scroll(self, ev):
         if self.y is None: return
         x0, x1 = self.ax.get_xlim()
         mx = ev.xdata if ev.xdata else (x0+x1)/2
-        f = 0.6 if ev.button == "up" else 1.6
-        tot = len(self.y)/self.sr
-        new_x0 = max(0, mx-(mx-x0)*f)
-        new_x1 = min(tot, mx+(x1-mx)*f)
-        self._redraw(xlim=(new_x0, new_x1))
+        f = 0.5 if ev.button == "up" else 2.0
+        self._redraw(xlim=(max(0, mx-(mx-x0)*f), min(len(self.y)/self.sr, mx+(x1-mx)*f)))
+
+    def _fit_segments(self):
+        if self.segments: self._redraw()  # default xlim auto-fits
+        elif self.y is not None: self._redraw(xlim=(0, len(self.y)/self.sr))
 
     def _reset_view(self):
-        if self.y is not None:
-            self._redraw(xlim=(0, len(self.y)/self.sr))
+        if self.y is not None: self._redraw(xlim=(0, len(self.y)/self.sr))
 
     # ── Export ────────────────────────────────────────────────────────────
     def on_export(self):
@@ -1146,10 +1196,13 @@ class MainWindow(QMainWindow):
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
-                w.writerow(["index","ground_truth","prediction","accuracy","start","end"])
+                w.writerow(["index", "type", "mode", "ground_truth", "prediction",
+                            "compare_to", "accuracy", "start", "end"])
                 for r in self.results:
-                    w.writerow([r["i"]+1, r["gt"], r["pred"], f"{r['acc']:.4f}",
-                                f"{r['start']:.4f}", f"{r['end']:.4f}"])
+                    acc_s = f"{r['acc']:.4f}" if r["acc"] >= 0 else "N/A"
+                    w.writerow([r["i"]+1, r["type"], r["mode"], r["gt"],
+                                r["pred"], r.get("compare_to", ""),
+                                acc_s, f"{r['start']:.4f}", f"{r['end']:.4f}"])
             self.lbl_status.setText(f"Exported: {path}")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
@@ -1157,14 +1210,16 @@ class MainWindow(QMainWindow):
 
 # ══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  Indic Speech Annotation Tool ")
-    print(f"  Engines: IndicConformer={'✓' if _HF else '✗'}  "
-          f"faster-whisper={'✓' if _FW else '✗'}  HF={'✓' if _HF else '✗'}")
+    # Create transcripts folder if missing
+    TRANSCRIPTS_DIR.mkdir(exist_ok=True)
+
+    print("=" * 65)
+    print("  Indic Speech Annotation Tool — Auto Mode")
+    print(f"  Transcripts folder: {TRANSCRIPTS_DIR}")
     if _HF:
         cuda = torch.cuda.is_available()
         print(f"  CUDA: {cuda}" + (f" ({torch.cuda.get_device_name(0)})" if cuda else ""))
-    print("=" * 60)
+    print("=" * 65)
 
     app = QApplication(sys.argv)
     app.setStyleSheet("""
