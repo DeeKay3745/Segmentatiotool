@@ -309,9 +309,6 @@ class MainWindow(QMainWindow):
         for w in [QLabel("Language:"),self.cb_lang,self.lbl_mn,self.btn_audio,self.btn_gt,self.btn_model]: r1.addWidget(w)
         r1.addStretch()
 
-        self.lbl_tx=QLabel("");self.lbl_tx.setTextFormat(Qt.RichText)
-        self.lbl_tx.setStyleSheet("padding:4px 8px;font-size:11px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:4px")
-
         r2=QHBoxLayout()
         actions=[("▶ Run",self.on_run,"font-weight:bold;color:#16a34a"),("⏹ Stop",self.on_stop,""),
             ("VAD Segment",self.on_vad,""),("♫ Play Seg",self.on_play_seg,""),("⏸ Stop",sd.stop,""),
@@ -353,7 +350,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(seg_tab,"Segments");tabs.addTab(vad_box,"VAD")
         left=QWidget();ll=QVBoxLayout(left);ll.addWidget(self.toolbar);ll.addWidget(self.canvas)
         spl=QSplitter(Qt.Horizontal);spl.addWidget(left);spl.addWidget(tabs);spl.setSizes([1250,400])
-        L.addLayout(r1);L.addWidget(self.lbl_tx);L.addLayout(r2);L.addLayout(sr);L.addWidget(self.pbar);L.addWidget(spl)
+        L.addLayout(r1);L.addLayout(r2);L.addLayout(sr);L.addWidget(self.pbar);L.addWidget(spl)
         self._on_lang_changed()
 
     def _set_busy(self,busy,msg=""):
@@ -365,30 +362,25 @@ class MainWindow(QMainWindow):
         if self.y is None: self.wave_t=self.wave_y=None;return
         st=max(1,len(self.y)//30000);self.wave_y=self.y[::st];self.wave_t=np.arange(len(self.wave_y))*(st/self.sr)
     def _get_model(self,iso): return INDIC_MODEL if iso in("gu","hi","mr") else ENGLISH_MODEL
-    
+
     def _on_lang_changed(self):
         iso,name=self.cb_lang.currentData()
         mdl=self._get_model(iso)
         if mdl:
             ek,mid=mdl;mn="IndicConformer-600M" if ek=="indicconformer" else f"Whisper {mid.split('/')[-1]}"
             self.lbl_mn.setText(f"Model: {mn}")
+            # Check if loaded model matches what this language needs
+            if ENGINE.is_loaded and ENGINE._ck==(ek,mid):
+                self.btn_model.setText("✓ Loaded")
+                self.btn_model.setStyleSheet("QPushButton{font-weight:bold;color:white;background:#16a34a;border:1px solid #15803d;padding:5px 14px;border-radius:4px}")
+            else:
+                self.btn_model.setText("⬇ Load Model")
+                self.btn_model.setStyleSheet("QPushButton{font-weight:bold;color:white;background:#2563eb;border:1px solid #1d4ed8;padding:5px 14px;border-radius:4px}QPushButton:hover{background:#1d4ed8}QPushButton:disabled{color:#9ca3af;background:#f3f4f6}")
+                if ENGINE.is_loaded:
+                    self.lbl_status.setText(f"⚠ Switch to {name} requires loading {mn} — click Load Model")
         else: self.lbl_mn.setText("⚠ No model")
-        ok,msg=TRANSCRIPTS.load(iso)
-        if ok:
-            comp=TRANSCRIPTS.get_completeness();parts=[]
-            for k in ["s1","s2","s3","s4","s5","paragraph"]:
-                s=comp.get(k,"missing")
-                if s=="ok": parts.append(f'<span style="color:#16a34a">✓{k.upper()}</span>')
-                elif s=="placeholder": parts.append(f'<span style="color:#d97706">⚠{k.upper()}</span>')
-                else: parts.append(f'<span style="color:#dc2626">✗{k.upper()}</span>')
-            nok=sum(1 for v in comp.values() if v=="ok")
-            if nok==6: px=f'<span style="color:#16a34a">📄 {iso}.txt — All sections ready ✓</span>'
-            elif nok==0: px=f'<span style="color:#dc2626">📄 {iso}.txt — ⚠ All sections need editing!</span>'
-            else: px=f'<span style="color:#d97706">📄 {iso}.txt — {nok}/6 ready:</span>'
-            self.lbl_tx.setText(f'{px}  │  {"  ".join(parts)}')
-        else:
-            self.lbl_tx.setText(f'<span style="color:#dc2626">⚠ Create transcripts/{iso}.txt to enable S1-S5 & Paragraph accuracy</span>')
-    
+        TRANSCRIPTS.load(iso)
+
     def on_load_audio(self):
         path,_=QFileDialog.getOpenFileName(self,"Audio","","Audio (*.wav *.mp3 *.flac *.ogg *.m4a)")
         if not path: return
@@ -454,9 +446,21 @@ class MainWindow(QMainWindow):
         if self.y16 is None: QMessageBox.warning(self,"","Load audio.");return
         if not self.segments: QMessageBox.warning(self,"","Load GT or VAD.");return
         if not ENGINE.is_loaded: QMessageBox.warning(self,"","Load model first.");return
+        # Check model matches language
+        iso,name=self.cb_lang.currentData()
+        mdl=self._get_model(iso)
+        if mdl:
+            ek,mid=mdl
+            if ENGINE._ck!=(ek,mid):
+                mn="IndicConformer-600M" if ek=="indicconformer" else f"Whisper {mid.split('/')[-1]}"
+                QMessageBox.warning(self,"Wrong Model",
+                    f"Language '{name}' requires {mn},\n"
+                    f"but a different model is loaded.\n\n"
+                    f"Click 'Load Model' first.")
+                return
         t=self._threads.get("pred")
         if t and t.isRunning(): return
-        iso,name=self.cb_lang.currentData();self.results=[];self.pbar.setValue(0);self._pred_t0=time.time()
+        self.results=[];self.pbar.setValue(0);self._pred_t0=time.time()
         self._set_busy(True,"Running...");self._refresh_list()
         t=PredictionThread(self.y16,self.segments,iso,name)
         t.seg_result.connect(self._osr);t.progress.connect(self._opp);t.done.connect(self._opd);t.error.connect(self._ope)
