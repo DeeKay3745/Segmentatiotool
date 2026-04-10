@@ -654,7 +654,7 @@ def run_vad(state, silence_ms, thresh_db, min_ms, max_ms):
     state["status"] = f"VAD created {len(state['segments'])} segments"
     return state, state["status"], seg_df, fig
 
-
+"""
 def run_prediction(lang_display, state, progress=gr.Progress()):
     state = state or default_state()
     if state.get("y16") is None:
@@ -712,7 +712,72 @@ def run_prediction(lang_display, state, progress=gr.Progress()):
     }])
     state["status"] = f"Done: {len(results)} segments in {elapsed:.2f}s | mean accuracy={mean_acc:.4f}"
     return state, state["status"], fig, df, summary, csv_path
+"""
+def run_prediction(lang_display, state, progress=gr.Progress()):
+    state = state or default_state()
+    if state.get("y16") is None:
+        return state, "Load audio first", None, None, None, None
+    if not state.get("segments"):
+        return state, "Load GT or run VAD first", None, None, None, None
+    if not ENGINE.is_loaded:
+        return state, "Load model first", None, None, None, None
 
+    iso, lang_name, model = model_for_language(lang_display)
+    if model and ENGINE._ck != model:
+        return state, "Wrong model loaded for selected language. Click Load Model.", None, None, None, None
+
+    TRANSCRIPTS.load(iso)
+    results = []
+    total = len(state["segments"])
+    t0 = time.time()
+
+    for i, seg in enumerate(state["segments"]):
+        progress((i, total), desc=f"Processing segment {i+1}/{total}")
+        info = classify_segment(seg["label"])
+        s = max(0, int(seg["start"] * SR16))
+        e = min(len(state["y16"]), int(seg["end"] * SR16))
+        pred = ENGINE.transcribe(state["y16"][s:e], iso, lang_name, info["mode"])
+
+        if info["is_seq"] and info["compare_to"]:
+            acc = accuracy(pred, info["compare_to"])
+        elif info["is_seq"]:
+            acc = -1.0
+        else:
+            acc = accuracy(pred, seg["label"])
+
+        results.append({
+            "i": i,
+            "gt": seg["label"],
+            "pred": pred,
+            "start": seg["start"],
+            "end": seg["end"],
+            "acc": acc,
+            "type": info["type"],
+            "mode": info["mode"],
+            "is_seq": info["is_seq"],
+            "compare_to": info.get("compare_to") or "",
+            "ref_status": info.get("ref_status", ""),
+        })
+
+    elapsed = time.time() - t0
+    state["results"] = results
+
+    fig = make_waveform_figure(state["y"], state["sr"], state["segments"], results)
+    df = results_to_df(results)
+    csv_path = export_results_csv(results)
+
+    valid_scores = [r["acc"] for r in results if r["acc"] >= 0]
+    mean_acc = np.mean(valid_scores) if valid_scores else 0.0
+
+    summary = pd.DataFrame([{
+        "segments": len(results),
+        "mean_accuracy": round(float(mean_acc), 4),
+        "elapsed_sec": round(float(elapsed), 2),
+        "engine": ENGINE.engine_key,
+    }])
+
+    state["status"] = f"Done: {len(results)} segments in {elapsed:.2f}s | mean accuracy={mean_acc:.4f}"
+    return state, state["status"], fig, df, summary, csv_path
 
 def play_selected_segment(state, segment_index):
     state = state or default_state()
