@@ -1,11 +1,4 @@
-#!/usr/bin/env python3
-"""
-Indic Speech Annotation Tool
-==============================
-Languages: Gujarati, Hindi, Marathi, English
-Models auto-selected: IndicConformer (Indic) | Whisper large-v3 (English)
-Auto-detects: char → word → sentence/paragraph per segment
-"""
+
 
 import os, sys, csv, re, time, traceback
 from datetime import datetime
