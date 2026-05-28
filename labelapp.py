@@ -1633,6 +1633,20 @@ class MainWindow(QMainWindow):
         self._suppress_spin = False
         self._threads = {}
 
+        # Undo / redo: ring buffers of deep-copied segment snapshots.
+        # We snapshot *before* each mutating action via self._push_undo().
+        self._undo_stack = []   # list[(segments_snapshot, selected_idx)]
+        self._redo_stack = []
+        self._undo_limit = 60
+
+        # Per-segment timing log for the paper's "annotation time" study.
+        # Maps segment-identity -> seconds the annotator spent with it
+        # selected. Lets us report time-per-segment without a stopwatch.
+        self._timing_log = {}          # {seg_uid: cumulative_seconds}
+        self._timing_active_uid = None
+        self._timing_active_since = None
+        self._session_start = time.time()
+
         self.current_words = []  # current language's wordlist (chars + words combined for picker)
         self.current_chars = []
         self.current_sentences = {}
@@ -2168,6 +2182,19 @@ class MainWindow(QMainWindow):
         seg_btns.addWidget(self.btn_load_to_region)
         sv.addLayout(seg_btns)
 
+        # Undo / redo row
+        undo_row = QHBoxLayout()
+        self.btn_undo = QPushButton("↩ Undo")
+        self.btn_undo.setToolTip("Undo the last add/delete/relabel/retime  (Ctrl+Z)")
+        self.btn_undo.clicked.connect(self.on_undo)
+        undo_row.addWidget(self.btn_undo)
+        self.btn_redo = QPushButton("↪ Redo")
+        self.btn_redo.setToolTip("Redo  (Ctrl+Shift+Z or Ctrl+Y)")
+        self.btn_redo.clicked.connect(self.on_redo)
+        undo_row.addWidget(self.btn_redo)
+        undo_row.addStretch()
+        sv.addLayout(undo_row)
+
         right_tabs.addTab(segs_tab, "Segments")
 
         # --- Files tab (multi-file project mode) ---
@@ -2257,6 +2284,25 @@ class MainWindow(QMainWindow):
         )
         self.btn_compute_score.clicked.connect(self._update_score_panel)
         sv2.addWidget(self.btn_compute_score)
+
+        # Export row: paper-ready metrics report + training manifest
+        exp_row = QHBoxLayout()
+        self.btn_export_report = QPushButton("📄 Export metrics report")
+        self.btn_export_report.setToolTip(
+            "Save a text report of all metrics (acceptance rate, edit-WER, "
+            "timing, per-language breakdown) — paste-ready for your paper."
+        )
+        self.btn_export_report.clicked.connect(self.on_export_metrics_report)
+        exp_row.addWidget(self.btn_export_report)
+
+        self.btn_export_manifest = QPushButton("📦 Export training manifest (JSONL)")
+        self.btn_export_manifest.setToolTip(
+            "Export one JSON line per segment (audio path, offsets, label, "
+            "prediction) — ready for ASR fine-tuning pipelines."
+        )
+        self.btn_export_manifest.clicked.connect(self.on_export_manifest)
+        exp_row.addWidget(self.btn_export_manifest)
+        sv2.addLayout(exp_row)
         self.txt_score = QLabel(
             "<i style='color:#888'>Load GT or run Auto-Detect / Align GT, "
             "then click '📊 Compute accuracy now' to see the report.</i>"
@@ -2310,6 +2356,16 @@ class MainWindow(QMainWindow):
         self._sc_add_seg.activated.connect(self.on_add_segment)
         self._sc_save = QShortcut(QKeySequence("Ctrl+S"), self)
         self._sc_save.activated.connect(self.on_save_csv)
+        # Undo / redo
+        self._sc_undo = QShortcut(QKeySequence("Ctrl+Z"), self)
+        self._sc_undo.activated.connect(self.on_undo)
+        self._sc_redo = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
+        self._sc_redo.activated.connect(self.on_redo)
+        self._sc_redo2 = QShortcut(QKeySequence("Ctrl+Y"), self)
+        self._sc_redo2.activated.connect(self.on_redo)
+        # Delete selected segment
+        self._sc_del = QShortcut(QKeySequence("Ctrl+Backspace"), self)
+        self._sc_del.activated.connect(self.on_delete_segment)
 
     # ----- Language / wordlist handling -----
     def _current_lang(self):
@@ -3993,6 +4049,48 @@ class MainWindow(QMainWindow):
         self._redraw(xlim=(new_x0, new_x1))
 
 
+    # ----- Undo / redo -----
+    def _push_undo(self):
+        """Snapshot current segment state BEFORE a mutating action."""
+        import copy
+        snap = (copy.deepcopy(self.segments), self._selected_seg_idx)
+        self._undo_stack.append(snap)
+        if len(self._undo_stack) > self._undo_limit:
+            self._undo_stack.pop(0)
+        # Any new action invalidates the redo history
+        self._redo_stack.clear()
+
+    def on_undo(self):
+        if not self._undo_stack:
+            self._set_status("Nothing to undo")
+            return
+        import copy
+        # Save current state to redo, restore previous
+        self._redo_stack.append(
+            (copy.deepcopy(self.segments), self._selected_seg_idx)
+        )
+        segs, sel = self._undo_stack.pop()
+        self.segments = segs
+        self._selected_seg_idx = sel
+        self._refresh_seg_list()
+        self._redraw(xlim=self.ax.get_xlim() if self.y is not None else None)
+        self._set_status(f"Undo  ({len(self._undo_stack)} more available)")
+
+    def on_redo(self):
+        if not self._redo_stack:
+            self._set_status("Nothing to redo")
+            return
+        import copy
+        self._undo_stack.append(
+            (copy.deepcopy(self.segments), self._selected_seg_idx)
+        )
+        segs, sel = self._redo_stack.pop()
+        self.segments = segs
+        self._selected_seg_idx = sel
+        self._refresh_seg_list()
+        self._redraw(xlim=self.ax.get_xlim() if self.y is not None else None)
+        self._set_status(f"Redo  ({len(self._redo_stack)} more available)")
+
     # ----- Segment list -----
     def on_add_segment(self):
         if self.y is None:
@@ -4009,6 +4107,7 @@ class MainWindow(QMainWindow):
                "start": float(self.region_start),
                "end": float(self.region_end),
                "prediction": ""}  # manual segments have no model prediction
+        self._push_undo()
         self.segments.append(seg)
         self._refresh_seg_list()
         self._set_status(f"Added: {label} [{seg['start']:.3f}–{seg['end']:.3f}s]  (total: {len(self.segments)})")
@@ -4076,8 +4175,15 @@ class MainWindow(QMainWindow):
     def _on_seg_clicked(self, item):
         idx = self.seg_list.row(item)
         if 0 <= idx < len(self.segments):
-            self._selected_seg_idx = idx
+            # Timing: close out the previously-selected segment's timer and
+            # start one for this segment. Identity = label+start so it's stable
+            # across reorders. Used by the Analytics tab for the paper study.
+            self._timing_flush()
             seg = self.segments[idx]
+            self._timing_active_uid = self._seg_uid(seg)
+            self._timing_active_since = time.monotonic()
+
+            self._selected_seg_idx = idx
             # Zoom waveform to show this segment with some padding
             pad = max(0.5, (seg["end"] - seg["start"]) * 0.5)
             x0 = max(0.0, seg["start"] - pad)
@@ -4086,14 +4192,30 @@ class MainWindow(QMainWindow):
             # Update the Diff tab so the right pane reflects the new selection
             self._update_diff_panel()
 
+    @staticmethod
+    def _seg_uid(seg):
+        """Stable-ish identity for timing accounting."""
+        return f"{seg.get('label','')}|{seg.get('start',0):.3f}"
+
+    def _timing_flush(self):
+        """Add elapsed time on the currently-active segment to its tally."""
+        if self._timing_active_uid is not None and self._timing_active_since is not None:
+            dt = time.monotonic() - self._timing_active_since
+            if 0 < dt < 3600:  # ignore absurd gaps (left it open overnight)
+                self._timing_log[self._timing_active_uid] = (
+                    self._timing_log.get(self._timing_active_uid, 0.0) + dt
+                )
+        self._timing_active_since = time.monotonic()
+
     def on_delete_segment(self):
         idx = self.seg_list.currentRow()
         if idx < 0 or idx >= len(self.segments):
             return
+        self._push_undo()
         seg = self.segments.pop(idx)
         self._selected_seg_idx = None
         self._refresh_seg_list()
-        self._set_status(f"Deleted: {seg['label']} [{seg['start']:.3f}–{seg['end']:.3f}s]")
+        self._set_status(f"Deleted: {seg['label']} [{seg['start']:.3f}–{seg['end']:.3f}s]  (Ctrl+Z to undo)")
         self._redraw(xlim=self.ax.get_xlim() if self.y is not None else None)
 
     def on_relabel_segment(self):
@@ -4104,6 +4226,7 @@ class MainWindow(QMainWindow):
         if not new_label:
             QMessageBox.warning(self, "", "Type or pick a label first (top right).")
             return
+        self._push_undo()
         old = self.segments[idx]["label"]
         self.segments[idx]["label"] = new_label
         self._refresh_seg_list()
@@ -4118,6 +4241,7 @@ class MainWindow(QMainWindow):
         if self.region_start is None or self.region_end is None or self.region_end <= self.region_start:
             QMessageBox.warning(self, "", "Mark a new region first.")
             return
+        self._push_undo()
         self.segments[idx]["start"] = float(self.region_start)
         self.segments[idx]["end"] = float(self.region_end)
         self._refresh_seg_list()
@@ -4499,15 +4623,32 @@ class MainWindow(QMainWindow):
             n_perfect = n_partial = n_bad = 0
 
         # Header summary
+        m = self.compute_metrics()
         html = (
             f"<div style='font-size:13px;font-weight:bold;color:#111'>"
             f"Avg accuracy: <span style='color:#0e7490'>{avg:.3f}</span>  "
             f"({len(scored)} scored, {n_no_pred} no PRED)</div>"
-            f"<div style='margin:6px 0 10px'>"
+            f"<div style='margin:6px 0 4px'>"
             f"<span style='color:#15803d'>✓ {n_perfect} ≥ 95%</span>  ·  "
             f"<span style='color:#b45309'>~ {n_partial} 50–95%</span>  ·  "
             f"<span style='color:#b91c1c'>✗ {n_bad} &lt; 50%</span>"
             f"</div>"
+            # Paper-grade metrics block
+            f"<div style='margin:8px 0;padding:8px;background:#f8fafc;"
+            f"border:1px solid #e2e8f0;border-radius:4px;font-size:11px'>"
+            f"<b>Acceptance rate:</b> {m['acceptance_rate']*100:.1f}% "
+            f"({m['accepted']} kept / {m['edited']} edited)<br>"
+            f"<b>Avg WER:</b> {m['avg_wer']:.3f}<br>"
+            f"<b>Timing MAE:</b> start {m['mae_start']:.3f}s · end {m['mae_end']:.3f}s<br>"
+            f"<b>Time/seg:</b> "
+            + (f"mean {m['mean_time_s']:.1f}s · median {m['median_time_s']:.1f}s "
+               f"({m['n_timed']} timed)"
+               if m['n_timed'] else "<i>not yet measured</i>")
+            + f"<br><b>Types:</b> "
+            + " · ".join(f"{t}:{c}" for t, c in sorted(m['per_type'].items()))
+            + (f" · <span style='color:#ea580c'>partial-para:{m['partial_paragraphs']}</span>"
+               if m['partial_paragraphs'] else "")
+            + "</div>"
         )
         # Per-segment table
         html += (
@@ -4531,6 +4672,214 @@ class MainWindow(QMainWindow):
             )
         html += "</table>"
         self.txt_score.setText(html)
+
+    # ----- Paper-grade metrics -----
+    @staticmethod
+    def _word_error_rate(ref, hyp):
+        """Standard WER between reference and hypothesis strings."""
+        r = (ref or "").split()
+        h = (hyp or "").split()
+        if not r:
+            return 0.0 if not h else 1.0
+        # Levenshtein on word tokens
+        n, m = len(r), len(h)
+        dp = list(range(m + 1))
+        for i in range(1, n + 1):
+            prev, dp[0] = dp[0], i
+            for j in range(1, m + 1):
+                tmp = dp[j]
+                cost = 0 if r[i - 1] == h[j - 1] else 1
+                dp[j] = min(prev + cost, dp[j] + 1, dp[j - 1] + 1)
+                prev = tmp
+        return dp[m] / n
+
+    def compute_metrics(self):
+        """Compute the full metric bundle used by both the on-screen report
+        and the exported paper report. Returns a dict."""
+        iso, lang_name = self._current_lang()
+        self._timing_flush()  # make sure the active segment's time is counted
+
+        n_total = len(self.segments)
+        n_with_pred = 0
+        accepted = 0           # prediction kept verbatim as the label
+        edited = 0             # had a prediction but label differs
+        sims = []
+        wers = []
+        start_errs = []
+        end_errs = []
+        abs_start_errs = []
+        abs_end_errs = []
+        partial_paras = 0
+        per_type = {}          # type -> count
+        timing_vals = []
+
+        for seg in self.segments:
+            label = (seg.get("label") or "").strip()
+            pred = (seg.get("prediction") or "").strip()
+            stype = classify_segment_type(label)
+            per_type[stype] = per_type.get(stype, 0) + 1
+            uid = self._seg_uid(seg)
+            if uid in self._timing_log:
+                timing_vals.append(self._timing_log[uid])
+            if pred:
+                n_with_pred += 1
+                sims.append(_fuzzy_score(pred, label))
+                wers.append(self._word_error_rate(label, pred))
+                if _norm_for_compare(pred) == _norm_for_compare(label):
+                    accepted += 1
+                else:
+                    edited += 1
+            se = seg.get("start_err"); ee = seg.get("end_err")
+            if se is not None and ee is not None:
+                start_errs.append(se); end_errs.append(ee)
+                abs_start_errs.append(abs(se)); abs_end_errs.append(abs(ee))
+            frac = seg.get("_para_fraction")
+            if frac is not None and frac < 0.95:
+                partial_paras += 1
+
+        def _mean(xs):
+            return sum(xs) / len(xs) if xs else 0.0
+
+        total_dur = sum(s["end"] - s["start"] for s in self.segments)
+        return {
+            "language": lang_name,
+            "iso": iso,
+            "audio": Path(self.audio_path).name if self.audio_path else "—",
+            "n_total": n_total,
+            "n_with_pred": n_with_pred,
+            "accepted": accepted,
+            "edited": edited,
+            "acceptance_rate": (accepted / n_with_pred) if n_with_pred else 0.0,
+            "avg_similarity": _mean(sims),
+            "avg_wer": _mean(wers),
+            "mae_start": _mean(abs_start_errs),
+            "mae_end": _mean(abs_end_errs),
+            "mean_start_err": _mean(start_errs),
+            "mean_end_err": _mean(end_errs),
+            "n_timed": len(timing_vals),
+            "total_time_s": sum(timing_vals),
+            "median_time_s": (sorted(timing_vals)[len(timing_vals)//2]
+                              if timing_vals else 0.0),
+            "mean_time_s": _mean(timing_vals),
+            "session_s": time.time() - self._session_start,
+            "per_type": per_type,
+            "partial_paragraphs": partial_paras,
+            "total_labeled_dur_s": total_dur,
+        }
+
+    def _format_metrics_report(self, m):
+        """Plain-text, paste-ready metrics report for the paper."""
+        lines = []
+        lines.append("=" * 60)
+        lines.append("  SPEECH ANNOTATION — METRICS REPORT")
+        lines.append("=" * 60)
+        lines.append(f"Audio          : {m['audio']}")
+        lines.append(f"Language       : {m['language']} ({m['iso']})")
+        lines.append(f"Segments       : {m['n_total']}  "
+                     f"(labeled audio: {m['total_labeled_dur_s']:.1f}s)")
+        lines.append("")
+        lines.append("-- Segment types --")
+        for t, c in sorted(m["per_type"].items()):
+            lines.append(f"   {t:<10}: {c}")
+        if m["partial_paragraphs"]:
+            lines.append(f"   partial paragraphs flagged: {m['partial_paragraphs']}")
+        lines.append("")
+        lines.append("-- ASR pre-labeling quality --")
+        lines.append(f"   segments with prediction : {m['n_with_pred']}")
+        lines.append(f"   acceptance rate          : {m['acceptance_rate']*100:.1f}%  "
+                     f"({m['accepted']} kept verbatim, {m['edited']} edited)")
+        lines.append(f"   avg char similarity      : {m['avg_similarity']:.3f}")
+        lines.append(f"   avg word error rate (WER): {m['avg_wer']:.3f}")
+        lines.append("")
+        lines.append("-- Timestamp prediction error (pred vs GT) --")
+        if m["mae_start"] or m["mae_end"]:
+            lines.append(f"   MAE start : {m['mae_start']:.3f}s   "
+                         f"(mean signed {m['mean_start_err']:+.3f}s)")
+            lines.append(f"   MAE end   : {m['mae_end']:.3f}s   "
+                         f"(mean signed {m['mean_end_err']:+.3f}s)")
+        else:
+            lines.append("   (run 🎯 Predict on GT to populate timing errors)")
+        lines.append("")
+        lines.append("-- Annotation timing (this session) --")
+        lines.append(f"   segments timed   : {m['n_timed']}")
+        if m["n_timed"]:
+            lines.append(f"   mean time/seg    : {m['mean_time_s']:.1f}s")
+            lines.append(f"   median time/seg  : {m['median_time_s']:.1f}s")
+            lines.append(f"   total active time: {m['total_time_s']:.1f}s")
+        lines.append(f"   session length   : {m['session_s']:.0f}s")
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+    def on_export_metrics_report(self):
+        if not self.segments:
+            QMessageBox.warning(self, "", "No segments to report on.")
+            return
+        m = self.compute_metrics()
+        report = self._format_metrics_report(m)
+        default = "metrics_report.txt"
+        if self.audio_path:
+            default = Path(self.audio_path).stem + "_metrics.txt"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export metrics report", str(OUTPUT_DIR / default),
+            "Text (*.txt)",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(report, encoding="utf-8")
+            self._set_status(f"✓ Metrics report → {path}")
+            # Also echo into the Score panel so the user sees it immediately
+            self.txt_score.setText(
+                "<pre style='font-size:11px'>" + self._esc(report) + "</pre>"
+            )
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.critical(self, "Export error", str(e))
+
+    def on_export_manifest(self):
+        if not self.segments:
+            QMessageBox.warning(self, "", "No segments to export.")
+            return
+        if not self.audio_path:
+            QMessageBox.warning(self, "", "Load the audio file first.")
+            return
+        import json
+        iso, lang_name = self._current_lang()
+        default = "manifest.jsonl"
+        if self.audio_path:
+            default = Path(self.audio_path).stem + "_manifest.jsonl"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export training manifest", str(OUTPUT_DIR / default),
+            "JSON Lines (*.jsonl)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                for seg in self.segments:
+                    rec = {
+                        "audio_filepath": str(self.audio_path),
+                        "offset": round(float(seg["start"]), 3),
+                        "duration": round(float(seg["end"] - seg["start"]), 3),
+                        "start": round(float(seg["start"]), 3),
+                        "end": round(float(seg["end"]), 3),
+                        "text": seg.get("label", ""),
+                        "prediction": seg.get("prediction", ""),
+                        "type": classify_segment_type(seg.get("label", "")),
+                        "language": iso,
+                    }
+                    # Include partial-paragraph info if present
+                    if seg.get("_para_fraction") is not None:
+                        rec["para_fraction"] = round(seg["_para_fraction"], 3)
+                        rec["para_spoken_words"] = seg.get("_para_spoken_words")
+                        rec["para_total_words"] = seg.get("_para_total_words")
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            self._set_status(
+                f"✓ Manifest ({len(self.segments)} segments) → {path}"
+            )
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.critical(self, "Export error", str(e))
 
     # ----- Auto-save / crash recovery -----
     def _autosave_path(self):

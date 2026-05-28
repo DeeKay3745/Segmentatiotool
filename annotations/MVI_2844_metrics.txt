@@ -1,0 +1,24 @@
+============================================================
+  SPEECH ANNOTATION — METRICS REPORT
+============================================================
+Audio          : MVI_2844.wav
+Language       : gujarati (gu)
+Segments       : 28  (labeled audio: 273.5s)
+
+-- Segment types --
+   sentence  : 28
+
+-- ASR pre-labeling quality --
+   segments with prediction : 28
+   acceptance rate          : 100.0%  (28 kept verbatim, 0 edited)
+   avg char similarity      : 1.000
+   avg word error rate (WER): 0.000
+
+-- Timestamp prediction error (pred vs GT) --
+   MAE start : 0.000s   (mean signed +0.000s)
+   MAE end   : 0.000s   (mean signed +0.000s)
+
+-- Annotation timing (this session) --
+   segments timed   : 0
+   session length   : 558s
+============================================================
