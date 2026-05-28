@@ -1,0 +1,80 @@
+﻿index,type,mode,ground_truth,prediction,compared_against,accuracy,start,end
+1,char,char,A,E,A,0.0000,7.2960,7.9200
+2,char,char,B,M,B,0.0000,13.5680,14.2000
+3,char,char,C,S,C,0.0000,19.8000,21.0600
+4,char,char,D,D,D,1.0000,26.1440,26.8400
+5,char,char,E,,E,0.0000,7.9200,8.6800
+6,char,char,F,I,F,0.0000,14.2000,15.2400
+7,char,char,G,,G,0.0000,21.0600,21.9600
+8,char,char,I,I,I,1.0000,8.6800,10.3200
+9,char,char,J,Y,J,0.0000,15.6160,16.3800
+10,char,char,K,K,K,1.0000,21.9600,23.2200
+11,char,char,L,E,L,0.0000,27.9400,28.8000
+12,char,char,M,,M,0.0000,10.3200,11.3200
+13,char,char,N,A,N,0.0000,16.6080,17.1800
+14,char,char,O,,O,0.0000,23.2200,23.7600
+15,sentence,full,P,Pee.,,N/A,18.2200,19.4000
+16,char,char,R,A,R,0.0000,17.1800,18.2200
+17,sentence,full,S,is,,N/A,23.9040,24.6600
+18,char,char,T,,T,0.0000,29.6600,30.0800
+19,char,char,U,R,U,0.0000,11.3200,12.2200
+20,char,char,W,W,W,1.0000,24.6600,25.3760
+21,char,char,X,Y,X,0.0000,30.0800,30.5400
+22,char,char,Y,W,Y,0.0000,12.2200,13.1600
+23,char,char,Z,,Z,0.0000,19.4000,19.8000
+24,word,word,Their,They,Their,0.6000,40.5700,42.8700
+25,word,word,If,,If,0.0000,65.1600,66.3000
+26,word,word,Alpha,AFFA?,Alpha,0.4000,43.4400,44.5700
+27,word,word,Beta,Weta?,Beta,0.7500,66.8700,68.5900
+28,word,word,Delta,Dave,Delta,0.2000,87.4500,88.8800
+29,word,word,Could,Good.,Could,0.4000,107.1700,108.0200
+30,word,word,Circular,Is,Circular,0.1250,58.3000,60.3000
+31,word,word,Composure,KABOOCHER!,Composure,0.1111,79.7300,81.1600
+32,word,word,Footwork,For,Footwork,0.3750,101.1700,102.3100
+33,word,word,Journalism,Journalism,Journalism,1.0000,116.8800,118.8800
+34,word,word,Python,Python.,Python,1.0000,59.7300,61.7300
+35,word,word,Advice,And,Advice,0.1667,81.7300,82.8800
+36,word,word,Choice,Joy?,Choice,0.1667,102.5900,103.4500
+37,word,word,Immovable,Immumable.,Immovable,0.7778,61.7300,63.4400
+38,word,word,Massage,One,Massage,0.1429,83.4500,84.5900
+39,word,word,Moisten,more,Moisten,0.4286,103.4500,105.1700
+40,word,word,Knife,Nice.,Knife,0.6000,63.7300,64.3000
+41,word,word,Spoon,Ooh!,Spoon,0.4000,84.8800,85.7300
+42,word,word,Time,Time.,Time,1.0000,45.7200,47.1500
+43,word,word,Number,No,Number,0.1667,46.8700,48.5700
+44,word,word,Giggled,Girl?,Giggled,0.4286,49.1500,50.5700
+45,word,word,Upword,"Oh,",Upword,0.1667,50.5700,52.3000
+46,word,word,Control,Control?,Control,1.0000,52.5700,54.0100
+47,word,word,Uniform,in,Uniform,0.1429,56.3000,58.3000
+48,word,word,Has,Pass!,Has,0.3333,68.5900,70.3000
+49,word,word,Water,Water?,Water,1.0000,70.3000,71.4400
+50,word,word,Hypothesis,Hypothesis?,Hypothesis,1.0000,71.7300,73.7300
+51,word,word,November,No,November,0.2500,75.1600,76.3000
+52,word,word,Backspace,Back,Backspace,0.4444,85.7300,87.4500
+53,word,word,Look,Luke?,Look,0.2500,89.1600,90.0200
+54,word,word,Now,Now...,Now,1.0000,90.3100,91.4500
+55,word,word,Supervision,to,Supervision,0.0909,91.4500,93.1600
+56,paragraph,full,Paragraph,Bad dog?,"When the sunlight strikes raindrops in the air, they act as a prism and form a rainbow. The rainbow is a division of white light into many beautiful colors. These take the shape of a long round arch, with its path high above, and its two ends apparently beyond the horizon. There is, according to legend, a boiling pot of gold at one end. People look, but no one ever finds it. When a man looks for something beyond his reach, his friends say he is looking for the pot of gold at the end of the rainbow. Throughout the centuries people have explained the rainbow in various ways. Some have accepted it as a miracle without physical explanation.
+
+To the Hebrews it was a token that there would be no more universal floods. The Greeks used to imagine that it was a sign from the gods to foretell war or heavy rain. The Norsemen considered the rainbow as a bridge over which the gods passed from earth to their home in the sky. Others have tried to explain the phenomenon physically. Aristotle thought that the rainbow was caused by reflection of the sun's rays by the rain. Since then physicists have found that it is not reflection, but refraction by the raindrops which causes rainbows. Many complicated ideas about the rainbow have been formed.
+
+The difference in the rainbow depends considerably upon the size of the drops, and the width of the colored band increases as the size of the drops increases. The actual primary rainbow observed is said to be the effect of superimposition of a number of bows. If the red of the second bow falls upon the green of the first, the result is to give a bow with an abnormally wide yellow band, since red and green light when mixed form yellow. This is a very common type of bow, one showing mainly red and yellow, with little or no green or blue.",0.0042,94.0200,95.7400
+57,word,word,Bravo,BLEH,Bravo,0.2000,95.7400,97.4500
+58,word,word,India,India?,India,1.0000,97.4500,99.1700
+59,word,word,Shift,Chief?,Shift,0.4000,99.1700,100.3100
+60,word,word,Escape,Is,Escape,0.1667,104.8800,106.6000
+61,word,word,People,"Beep,",People,0.3333,108.3100,108.8800
+62,word,word,Find,Why?,Find,0.0000,109.1700,110.0200
+63,word,word,Download,download,Download,1.0000,110.3100,111.4500
+64,word,word,Oscar,Of,Oscar,0.2000,112.8800,114.0300
+65,word,word,Charlie,Charlie,Charlie,1.0000,114.3100,115.1700
+66,sentence,full,S1,Each unlimited income loss coincided with the breakdown of a heating system part.,Each untimely income loss coincided with the breakdown of a heating system part.,0.9254,129.1700,141.1700
+67,sentence,full,S2,The user's ability to work without supervision is not healthy.,Alice's ability to work without supervision is noteworthy.,0.7959,144.7500,151.7500
+68,sentence,full,S3,special task force-related holidays from Kinnapur.,Special task forces rescue hostages from kidnappers.,0.6889,152.6100,160.3200
+69,sentence,full,S4,"laugh, dance and sing if fortune smiles upon you.","Laugh, dance, and sing if fortune smiles upon you.",1.0000,161.1800,169.4700
+70,sentence,full,S5,The same shelter could be built into an embankment or below ground level.,The same shelter could be built into an embankment or below ground level.,1.0000,171.3800,181.7600
+71,paragraph,full,Paragraph,"When the sunlight strikes raindrops in the air, they act as prisms and form the rainbow. The rainbow is a division of white light into beautiful colors. There is, according to legend, a boiling pot of gold at one end people look but no one ever finds it. And a man looks for something beyond his reach.","When the sunlight strikes raindrops in the air, they act as a prism and form a rainbow. The rainbow is a division of white light into many beautiful colors. These take the shape of a long round arch, with its path high above, and its two ends apparently beyond the horizon. There is, according to legend, a boiling pot of gold at one end. People look, but no one ever finds it. When a man looks for something beyond his reach, his friends say he is looking for the pot of gold at the end of the rainbow. Throughout the centuries people have explained the rainbow in various ways. Some have accepted it as a miracle without physical explanation.
+
+To the Hebrews it was a token that there would be no more universal floods. The Greeks used to imagine that it was a sign from the gods to foretell war or heavy rain. The Norsemen considered the rainbow as a bridge over which the gods passed from earth to their home in the sky. Others have tried to explain the phenomenon physically. Aristotle thought that the rainbow was caused by reflection of the sun's rays by the rain. Since then physicists have found that it is not reflection, but refraction by the raindrops which causes rainbows. Many complicated ideas about the rainbow have been formed.
+
+The difference in the rainbow depends considerably upon the size of the drops, and the width of the colored band increases as the size of the drops increases. The actual primary rainbow observed is said to be the effect of superimposition of a number of bows. If the red of the second bow falls upon the green of the first, the result is to give a bow with an abnormally wide yellow band, since red and green light when mixed form yellow. This is a very common type of bow, one showing mainly red and yellow, with little or no green or blue.",0.1627,184.9000,245.9400

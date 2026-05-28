@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QFileDialog, QM
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox, QListWidget, QListWidgetItem,
     QSplitter, QProgressBar, QGroupBox, QDoubleSpinBox, QSpinBox, QTabWidget)
 
-try: import soundfile as sf; _SF=True
+try: import soundfile as sf; _SF=True 
 except: _SF=False
 try: from scipy.signal import resample_poly; from math import gcd; _SCIPY=True
 except: _SCIPY=False
