@@ -49,10 +49,7 @@ Adding another language is straightforward if a Whisper- or CTC-compatible model
 
 ## Screenshots
 
-<!-- Center an image -->
-<p align="center">
-  <img src="[images/screenshot.png](docs/img/Screenshot%202026-07-05%20at%2018.23.35.png)" alt="Project Screenshot" width="500">
-</p>
+![Project Image](docs/img/Screenshot%202026-07-05%20at%2018.23.35.png)
 
 
 ---
