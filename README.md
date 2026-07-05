@@ -49,13 +49,13 @@ Adding another language is straightforward if a Whisper- or CTC-compatible model
 
 ## Screenshots
 
-![Project Screenshot](docs/img/Screenshot 2026-07-05 at 18.23.35.png)
+![Project Screenshot](Segmentatiotool/docs/img/Screenshot 2026-07-05 at 18.23.35.png)
 
 ---
 
 ## Installation
 
-Requires **Python 3.9+**.
+Requires **Python 3.10+**.
 
 ```bash
 git clone https://github.com/<you>/annotator.git
