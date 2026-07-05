@@ -49,7 +49,7 @@ Adding another language is straightforward if a Whisper- or CTC-compatible model
 
 ## Screenshots
 
-*(Add screenshots to `docs/img/` and reference them here — the visual tour is more persuasive than any prose. Suggested captures: main waveform view with segments; the Score tab showing metrics; the Detect Splits confirmation dialog; the vocabulary picker.)*
+![Project Screenshot](docs/img/Screenshot 2026-07-05 at 18.23.35.png)
 
 ---
 
